@@ -1,0 +1,9 @@
+/target
+/rust/target/
+**/__pycache__/
+*.pyc
+**/.venv/
+**/node_modules/
+/ts/dist/
+.env
+/AGENTS.md
