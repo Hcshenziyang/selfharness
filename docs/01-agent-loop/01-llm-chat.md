@@ -12,7 +12,9 @@
 - Python：[`python/main.py`](../../python/main.py)
 - TypeScript：[`ts/main.ts`](../../ts/main.ts)
 
-顺着注释找找：配置和问题从哪里来？程序怎样发出请求，又是怎样取出模型回答的？运行方式见项目根目录的 README。
+这里是当前版本的入口。随着后续节点逐步加入多轮对话、工具调用和程序拆分，模型请求分别移到了 [`rust/src/model.rs`](../../rust/src/model.rs)、[`python/model.py`](../../python/model.py) 和 [`ts/model.ts`](../../ts/model.ts)。
+
+想看最初的一次请求，可以切换到「01 · 大模型对话」节点；运行与切换方式见项目根目录的 README。
 
 ## 扩展：接口长什么样？
 

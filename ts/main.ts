@@ -1,92 +1,15 @@
 import { createInterface } from "node:readline";
-type ToolCall = { id?: string; function?: { name?: string; arguments?: string } };
-type Message = {
-  role?: string;
-  content?: string | null;
-  tool_calls?: ToolCall[] | null;
-  tool_call_id?: string;
-  [key: string]: unknown;
-};
-type ModelResponse = {
-  choices?: Array<{ finish_reason?: string; message?: Message }>;
-};
-import { existsSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { initialPrompt, loadConfig } from "./config.ts";
+import { requestModel, type Message } from "./model.ts";
+import { executeTool, tools } from "./tools.ts";
 
-// 像 Rust 版一样，从当前目录向上找 .env；已有环境变量优先。
-function loadEnv(): void {
-  let directory = resolve(process.cwd());
-  while (true) {
-    const file = join(directory, ".env");
-    if (existsSync(file)) {
-      process.loadEnvFile(file);
-      return;
-    }
-    const parent = dirname(directory);
-    if (parent === directory) return;
-    directory = parent;
-  }
-}
-
-function requiredEnv(name: string): string {
-  const value = process.env[name];
-  if (!value?.trim()) throw new Error(`请设置环境变量 ${name}`);
-  return value;
-}
-
-loadEnv();
-const apiUrl = requiredEnv("LLM_API_URL");
-const apiKey = requiredEnv("LLM_API_KEY");
-const model = requiredEnv("LLM_MODEL");
-
-// 工具说明随请求发给模型，执行函数由我们的程序负责。
-const tools = [{
-  type: "function",
-  function: {
-    name: "add_numbers",
-    description: "计算两个数字的和",
-    parameters: {
-      type: "object",
-      properties: {
-        a: { type: "number", description: "第一个数字" },
-        b: { type: "number", description: "第二个数字" },
-      },
-      required: ["a", "b"],
-      additionalProperties: false,
-    },
-  },
-}];
-
-function executeTool(name: string, argumentsText: string): string {
-  // 模型传来的是字符串，解析前不能假设它一定是正确参数。
-  if (name !== "add_numbers") return JSON.stringify({ error: `未知工具：${name}` });
-  let args: unknown;
-  try {
-    args = JSON.parse(argumentsText);
-  } catch {
-    return JSON.stringify({ error: "工具参数不是有效的 JSON" });
-  }
-  if (typeof args !== "object" || args === null || Array.isArray(args)) {
-    return JSON.stringify({ error: "工具参数必须是对象" });
-  }
-  const object = args as Record<string, unknown>;
-  if (Object.keys(object).some((key) => key !== "a" && key !== "b")) {
-    return JSON.stringify({ error: "工具参数只允许包含 a 和 b" });
-  }
-  if (typeof object.a !== "number" || typeof object.b !== "number") {
-    return JSON.stringify({ error: "工具参数 a 和 b 都必须是数字" });
-  }
-  const sum = object.a + object.b;
-  if (!Number.isFinite(sum)) return JSON.stringify({ error: "计算结果超出可表示范围" });
-  return JSON.stringify({ result: sum });
-}
+const config = loadConfig();
 
 // 对话历史暂存在内存中；进程结束后就会消失。
 const messages: Message[] = [];
 const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
 const lines = input[Symbol.asyncIterator]();
-const firstPrompt = process.argv.slice(2).join(" ");
-let nextPrompt: string | undefined = firstPrompt.trim() ? firstPrompt : undefined;
+let nextPrompt = initialPrompt();
 
 try {
   while (true) {
@@ -105,16 +28,7 @@ try {
 
     // 每个用户问题各自有上限，模型可在一轮里多次调用工具。
     for (let requestIndex = 0; requestIndex < 8; requestIndex++) {
-      const response = await fetch(apiUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-        body: JSON.stringify({ model, messages, tools }),
-      }).catch(() => {
-        // 请求地址可能携带敏感信息，出错时不回显原始 URL。
-        throw new Error("模型请求失败，请检查模型服务地址或网络连接");
-      });
-      if (!response.ok) throw new Error(`模型请求失败：HTTP ${response.status}`);
-      const result = await response.json() as ModelResponse;
+      const result = await requestModel(config, messages, tools);
       const choice = result.choices?.[0];
       const message = choice?.message;
       if (!message || typeof message !== "object" || Array.isArray(message)) {

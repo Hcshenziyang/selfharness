@@ -14,7 +14,7 @@
 - Python：[`python/main.py`](../../python/main.py)
 - TypeScript：[`ts/main.ts`](../../ts/main.ts)
 
-顺着注释看看工具说明、执行函数和循环：模型提出调用后，程序是怎样把结果交回去的？
+入口保留了工具循环；工具说明和执行逻辑已经分别放在 [`rust/src/tools.rs`](../../rust/src/tools.rs)、[`python/tools.py`](../../python/tools.py) 和 [`ts/tools.ts`](../../ts/tools.ts)。顺着注释看看，模型提出调用后，结果是怎样交回去的？
 
 三个版本都提供 `add_numbers`，用两个数字做加法。留意一下：一次回复可能包含多个调用，每个结果都要带上对应的调用 ID。参数错误或工具不存在时，程序会把错误交回模型；每次提问也有请求次数上限，避免一直循环。
 
