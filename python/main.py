@@ -1,4 +1,4 @@
-"""第 1 节：一次大模型对话。"""
+"""第 2 节：把对话保存在内存中，继续提问。"""
 
 import os
 import sys
@@ -8,39 +8,50 @@ from dotenv import find_dotenv, load_dotenv
 
 
 def main():
-    # 在当前目录和父目录寻找 .env；已经设置的环境变量优先。
+    # .env 只作为补充，外部已经设置的变量仍然优先。
     env_file = find_dotenv(usecwd=True)
     if env_file:
         load_dotenv(env_file)
-
     api_url = required_env("LLM_API_URL")
     api_key = required_env("LLM_API_KEY")
     model = required_env("LLM_MODEL")
 
-    # 命令行里的文字组成一个问题；未提供时使用默认问题。
-    prompt = " ".join(sys.argv[1:]) or "你好，请介绍一下你自己。"
+    # 历史只存在当前进程中；每次请求都发送目前的完整消息列表。
+    messages = []
+    next_prompt = " ".join(sys.argv[1:]).strip() or None
+    while True:
+        if next_prompt is not None:
+            prompt, next_prompt = next_prompt, None
+        else:
+            try:
+                prompt = input("你：").strip()
+            except EOFError:  # Ctrl+D 也可以正常退出。
+                break
+        if not prompt.strip():
+            continue
+        if prompt.strip() in ("exit", "quit"):
+            break
 
-    # 模型服务接收消息列表，接口地址需要包含完整路径。
-    try:
-        response = requests.post(
-            api_url,
-            headers={"Authorization": f"Bearer {api_key}"},
-            json={"model": model, "messages": [{"role": "user", "content": prompt}]},
-            timeout=60,
-        )
-        response.raise_for_status()
-    except requests.RequestException as error:
-        # 不打印 URL 或请求头，避免把配置中的敏感内容写到终端。
-        raise RuntimeError("模型请求失败，请检查接口配置和网络") from None
-
-    # 取出第一条回答。这一节只请求一次，也不保存对话历史。
-    try:
-        answer = response.json()["choices"][0]["message"]["content"]
-    except (ValueError, KeyError, IndexError, TypeError):
-        raise RuntimeError("模型响应中没有找到文本回答") from None
-    if not isinstance(answer, str):
-        raise RuntimeError("模型响应中没有找到文本回答")
-    print(answer)
+        messages.append({"role": "user", "content": prompt})
+        try:
+            response = requests.post(
+                api_url,
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={"model": model, "messages": messages},
+                timeout=60,
+            )
+            response.raise_for_status()
+        except requests.RequestException:
+            raise RuntimeError("模型请求失败，请检查接口配置和网络") from None
+        try:
+            answer = response.json()["choices"][0]["message"]["content"]
+        except (ValueError, KeyError, IndexError, TypeError):
+            raise RuntimeError("模型响应中没有找到文本回答") from None
+        if not isinstance(answer, str):
+            raise RuntimeError("模型响应中没有找到文本回答")
+        print(f"助手：{answer}")
+        # 模型不知道我们的上一轮回答，所以下次请求也要一起带上。
+        messages.append({"role": "assistant", "content": answer})
 
 
 def required_env(name):

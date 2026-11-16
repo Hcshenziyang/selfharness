@@ -36,7 +36,7 @@ python python/main.py "你好"
 npm --prefix ts start -- "你好"
 ```
 
-不传问题时，程序使用默认问题；回答后自动结束。
+也可以不传问题，启动后再输入。输入 `exit` 或 `quit` 退出，也可以按 Ctrl+D 结束输入。
 
 ## 切换节点
 
