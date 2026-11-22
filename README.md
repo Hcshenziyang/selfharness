@@ -4,15 +4,13 @@
 
 ## 运行
 
-准备支持 Rust 2024 edition 的 Rust 和 Cargo，以及 DeepSeek API Key。在项目根目录创建 `.env`：
+准备支持 Rust 2024 edition 的 Rust 和 Cargo，以及 DeepSeek API Key。在项目根目录复制配置模板：
 
-```dotenv
-LLM_API_URL=https://api.deepseek.com/chat/completions
-LLM_API_KEY=your_api_key
-LLM_MODEL=deepseek-flash
+```sh
+cp .env.example .env
 ```
 
-把 `your_api_key` 换成自己的密钥。在同一个终端加载配置并运行：
+在 `.env` 中把 `your_api_key` 换成自己的密钥。在同一个终端加载配置并运行：
 
 ```sh
 set -a
