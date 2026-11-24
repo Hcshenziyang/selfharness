@@ -22,6 +22,9 @@ const conversationList = byId("conversation-list");
 let busy = false;
 let conversations = [];
 let activeConversationId = null;
+let activeHistory = [];
+const pendingTurns = new Map();
+const failedDrafts = new Map();
 
 // ─── Utilities ───
 function escapeHtml(str) {
@@ -72,7 +75,7 @@ function formatInline(text) {
 // ─── Auto-resize & Input Validation ───
 function updateInputState() {
   const hasText = Boolean(messageInput.value.trim());
-  sendMessageBtn.disabled = !hasText || busy;
+  sendMessageBtn.disabled = !hasText || busy || pendingTurns.has(activeConversationId);
 }
 
 function autoResize() {
@@ -277,7 +280,7 @@ function showConversationList() {
     const button = document.createElement("button");
     button.type = "button";
     button.className = "sidebar-action conversation-link";
-    button.textContent = item.title;
+    button.textContent = pendingTurns.has(item.id) ? `${item.title} · 回复中` : item.title;
     button.title = item.title;
     button.dataset.id = item.id;
     button.disabled = busy;
@@ -287,18 +290,37 @@ function showConversationList() {
 }
 
 function showConversation(info, historyMessages) {
+  if (activeConversationId !== info.id) messageInput.value = "";
   activeConversationId = info.id;
+  activeHistory = historyMessages;
   const url = new URL(location.href);
   url.searchParams.set("conversation", info.id);
   window.history.replaceState(null, "", url);
   byId("conversation-title").textContent = info.title;
   clearMessages();
   historyMessages.forEach(message => addMessage(message.role, message.content));
+  const pending = pendingTurns.get(info.id);
+  if (pending) {
+    addMessage("user", pending.text);
+    addMessage("assistant", "", true);
+  }
+  const failed = failedDrafts.get(info.id);
+  showChatError(failed?.error);
+  if (failed) {
+    messageInput.value = failed.text;
+    failedDrafts.delete(info.id);
+  }
+  autoResize();
   scrollToBottom();
   showConversationList();
 }
 
 async function openConversation(info) {
+  const pending = pendingTurns.get(info.id);
+  if (pending) {
+    showConversation(info, pending.history);
+    return;
+  }
   const data = await api(`/api/conversations/${info.id}/messages`);
   showConversation(info, data.messages);
 }
@@ -318,8 +340,6 @@ conversationList.addEventListener("click", async (event) => {
   showChatError("");
   try {
     await openConversation(info);
-    messageInput.value = "";
-    autoResize();
     sidebar.classList.remove("open");
     sidebarOverlay.hidden = true;
   } catch (error) {
@@ -522,6 +542,7 @@ serverForm.addEventListener("submit", async (event) => {
       if (token) headers.Authorization = `Bearer ${token}`;
       body = { name, type, url: byId("server-url").value.trim(), headers };
     }
+    body.supports_parallel_tool_calls = byId("server-parallel").checked;
 
     setBusy(true);
     const submitBtn = byId("connect-server");
@@ -541,33 +562,44 @@ serverForm.addEventListener("submit", async (event) => {
 byId("chat-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const text = messageInput.value.trim();
-  if (!text || busy) return;
+  if (!text || busy || pendingTurns.has(activeConversationId)) return;
 
-  showChatError("");
+  if (activeConversationId === null) {
+    setBusy(true);
+    try {
+      await newConversation();
+    } catch (error) {
+      showChatError(error.message);
+      return;
+    } finally {
+      setBusy(false);
+    }
+  }
+  const id = activeConversationId;
+  const history = activeHistory;
+  pendingTurns.set(id, { text, history });
   messageInput.value = "";
+  showChatError("");
+  addMessage("user", text);
+  addMessage("assistant", "", true);
   autoResize();
-
-  setBusy(true);
-  let userMessage, pending;
+  showConversationList();
   try {
-    if (activeConversationId === null) await newConversation();
-    userMessage = addMessage("user", text);
-    pending = addMessage("assistant", "", true);
-    const result = await api(`/api/conversations/${activeConversationId}/messages`, {
+    const result = await api(`/api/conversations/${id}/messages`, {
       method: "POST", body: { message: text },
     });
+    pendingTurns.delete(id);
     rememberConversation(result.conversation);
-    showConversation(result.conversation, result.messages);
+    if (activeConversationId === id) showConversation(result.conversation, result.messages);
   } catch (error) {
-    userMessage?.remove();
-    pending?.remove();
-    emptyChat.hidden = messages.children.length > 0;
-    messageInput.value = text;
-    autoResize();
-    showChatError(error.message);
+    pendingTurns.delete(id);
+    failedDrafts.set(id, { text, error: error.message });
+    if (activeConversationId === id) {
+      showConversation(conversations.find(item => item.id === id), history);
+    }
   } finally {
-    setBusy(false);
-    messageInput.focus();
+    showConversationList();
+    if (activeConversationId === id) messageInput.focus();
   }
 });
 
@@ -586,8 +618,6 @@ byId("new-chat").addEventListener("click", async () => {
   showChatError("");
   try {
     await newConversation();
-    messageInput.value = "";
-    autoResize();
   } catch (error) {
     showChatError(error.message);
   } finally {

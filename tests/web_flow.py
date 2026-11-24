@@ -1,5 +1,6 @@
 """模拟模型和 HTTP MCP，测试网页接口实际连接和工具调用。"""
 
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError
@@ -58,6 +59,7 @@ class Handler(BaseHTTPRequestHandler):
         tools = request.get("tools", [])
         if (self.headers.get("Authorization") != "Bearer model-secret" or request.get("model") != "model"
                 or request.get("store") is not False or request.get("stream") is not False
+                or request.get("parallel_tool_calls") is not True
                 or not isinstance(history, list) or not history or "messages" in request or "thinking" in request
                 or any(tool.get("type") != "function" or "function" in tool or "parameters" not in tool
                        for tool in tools)):
@@ -120,13 +122,17 @@ class Handler(BaseHTTPRequestHandler):
             names = ["a.b", "a b"] if self.server.state.get("duplicate_tools") else ["demo_code"]
             result = {"tools": [{"name": name, "description": "HTTP test",
                                  "inputSchema": {"type": "object", "properties": {}}} for name in names]}
+            if "mcp_tools" in self.server.state:
+                result = {"tools": self.server.state["mcp_tools"]}
         elif method == "tools/call":
-            result = {"content": [{"type": "text", "text": "HTTP-TEST-RESULT"}]}
+            callback = self.server.state.get("call_mcp")
+            result = callback(request["params"]["name"]) if callback else {
+                "content": [{"type": "text", "text": "HTTP-TEST-RESULT"}]}
         else:
             self.reply(404)
             return
         response = {"jsonrpc": "2.0", "id": request["id"], "result": result}
-        if method == "tools/call":
+        if method == "tools/call" and not self.server.state.get("json_tool_results"):
             # Streamable HTTP 的调用响应可以使用 SSE。
             self.reply(200, f"event: message\ndata: {json.dumps(response)}\n\n".encode(),
                        {"Content-Type": "text/event-stream", "Mcp-Session-Id": "web-test"})
@@ -202,6 +208,88 @@ class WebIntegration(unittest.TestCase):
         self.assertEqual(status, 200, info)
         self.assertEqual(info["title"], "新对话")
         return f"/api/conversations/{info['id']}/messages"
+
+    def connect_test_tools(self, hints, callback, *, server_parallel=False):
+        state = self.server.state
+        state["mcp_tools"] = [{"name": name, "inputSchema": {"type": "object"},
+                               **({"annotations": {"readOnlyHint": hint}} if hint is not None else {})}
+                              for name, hint in hints.items()]
+        state["call_mcp"] = callback
+        config = {"name": "remote", "type": "http", "url": f"http://127.0.0.1:{self.server.server_port}/mcp",
+                  "headers": {"Authorization": "Bearer test-token", "X-Test": "test-header"}}
+        if server_parallel:
+            config["supports_parallel_tool_calls"] = True
+        status, response = self.request("/api/mcp/servers", "POST", config)
+        self.assertEqual(status, 200, response)
+        state["tools"] = [f"mcp__remote__{name}" for name in hints]
+        state["results"] = {f"mcp__remote__{name}": name for name in hints}
+
+    def test_parallel_batch_and_exclusive_tool(self):
+        self.check_parallel_batch(server_parallel=False)
+
+    def test_server_parallel_override(self):
+        self.server.state["json_tool_results"] = True
+        self.check_parallel_batch(server_parallel=True)
+
+    def check_parallel_batch(self, server_parallel):
+        slow_started, fast_finished = threading.Event(), threading.Event()
+        events = []
+
+        def call(name):
+            events.append(("start", name))
+            if name == "slow":
+                slow_started.set()
+                if not fast_finished.wait(5):
+                    self.server.state["errors"].append("第二个工具没有并发执行")
+            if name == "fast" and not slow_started.wait(5):
+                self.server.state["errors"].append("第一个工具没有并发执行")
+            events.append(("end", name))
+            if name == "fast":
+                fast_finished.set()
+            return {"content": [{"type": "text", "text": name}], "isError": name == "fast"}
+
+        hints = ({"slow": False, "fast": None} if server_parallel else
+                 {"slow": True, "fast": True, "exclusive": None, "after": True})
+        self.connect_test_tools(hints, call, server_parallel=server_parallel)
+        # 快工具先以错误结束，模型仍应收到按原 call_id 顺序排列的全部结果。
+        self.server.state["results"]["mcp__remote__fast"] = '{"error":"fast"}'
+        status, result = self.request(self.new_conversation(), "POST", {"message": "并发调用"})
+        self.assertEqual(status, 200, result)
+        self.assertLess(events.index(("end", "fast")), events.index(("end", "slow")))
+        if not server_parallel:
+            self.assertLess(events.index(("end", "slow")), events.index(("start", "exclusive")))
+            self.assertLess(events.index(("end", "exclusive")), events.index(("start", "after")))
+        self.assertEqual(self.server.state["errors"], [])
+
+    def test_concurrent_conversations_and_ordered_turns(self):
+        entered, release = threading.Event(), threading.Event()
+
+        def call(name):
+            if not entered.is_set():
+                entered.set()
+                if not release.wait(10):
+                    self.server.state["errors"].append("另一段对话被慢工具阻塞")
+            return {"content": [{"type": "text", "text": name}]}
+
+        self.connect_test_tools({"exclusive": None}, call)
+        a, b = self.new_conversation(), self.new_conversation()
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            first = pool.submit(self.request, a, "POST", {"message": "A1"})
+            try:
+                self.assertTrue(entered.wait(5), "A1 没有进入慢工具")
+                second = pool.submit(self.request, a, "POST", {"message": "A2"})
+                other = pool.submit(self.request, b, "POST", {"message": "B1"})
+                self.assertEqual(other.result(timeout=5)[0], 200)
+                self.assertFalse(second.done())
+                self.assertEqual(self.request(a)[1]["messages"], [])
+            finally:
+                release.set()
+            self.assertEqual(first.result(timeout=5)[0], 200)
+            self.assertEqual(second.result(timeout=5)[0], 200)
+        history = self.request(a)[1]["messages"]
+        self.assertEqual([m["content"] for m in history], ["A1", "工具执行完成", "A2", "工具执行完成"])
+        self.assertEqual(self.request(b)[1]["messages"][0]["content"], "B1")
+        self.assertEqual(self.server.state["errors"], [])
 
     def test_web_chat_and_dynamic_mcp(self):
         status, html = self.request("/")

@@ -4,7 +4,8 @@ use crate::{
     llm::ask_llm,
     tools,
 };
-use reqwest::blocking::Client;
+use futures_util::future::join_all;
+use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
 use std::{collections::HashSet, error::Error};
@@ -17,17 +18,27 @@ struct ToolCall {
     status: Option<String>,
 }
 
-pub(crate) fn run_turn(
+impl ToolCall {
+    async fn execute(&self, mcp: &tools::McpTools) -> String {
+        let result = match serde_json::from_str(&self.arguments) {
+            Ok(arguments) => tools::call(&self.name, &arguments, mcp).await,
+            Err(error) => Err(format!("工具参数不是有效 JSON：{error}")),
+        };
+        result.unwrap_or_else(|error| json!({ "error": error }).to_string())
+    }
+}
+
+pub(crate) async fn run_turn(
     client: &Client,
     config: &Config,
     mut conversation: Conversation,
     user_input: &str,
-    mcp: &tools::McpClient,
+    mcp: &tools::McpTools,
 ) -> Result<Conversation, Box<dyn Error>> {
     conversation.add_user(user_input);
     let tool_definitions = tools::definitions(mcp);
     loop {
-        let output = ask_llm(client, config, conversation.messages(), &tool_definitions)?;
+        let output = ask_llm(client, config, conversation.messages(), &tool_definitions).await?;
         let calls = output
             .iter()
             .filter(|item| item["type"] == "function_call")
@@ -56,12 +67,14 @@ pub(crate) fn run_turn(
         if calls.is_empty() {
             return Ok(conversation);
         }
-        for call in calls {
-            let result = serde_json::from_str(&call.arguments)
-                .map_err(|error| format!("工具参数不是有效 JSON：{error}"))
-                .and_then(|arguments| tools::call(&call.name, &arguments, mcp));
-            let content = result.unwrap_or_else(|error| json!({ "error": error }).to_string());
-            conversation.add_tool_result(&call.call_id, content);
+        // 相邻的可并发调用一起跑。每个独占调用单独成组，等前一组结束才开始。
+        for group in calls.chunk_by(|left, right| {
+            tools::supports_parallel(&left.name, mcp) && tools::supports_parallel(&right.name, mcp)
+        }) {
+            let results = join_all(group.iter().map(|call| call.execute(mcp))).await;
+            for (call, content) in group.iter().zip(results) {
+                conversation.add_tool_result(&call.call_id, content);
+            }
         }
     }
 }

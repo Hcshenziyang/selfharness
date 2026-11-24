@@ -363,6 +363,11 @@ h1, h2, h3, h4, p, ul, ol {
   transition: border-color var(--duration-fast) var(--ease-smooth), box-shadow var(--duration-fast) var(--ease-smooth);
 }
 
+.server-form input[type="checkbox"] {
+  width: auto;
+  vertical-align: middle;
+}
+
 .server-form input::placeholder,
 .server-form textarea::placeholder {
   color: var(--sidebar-text-dim);

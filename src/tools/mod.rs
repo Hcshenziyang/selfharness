@@ -1,10 +1,9 @@
 mod mcp;
 
-pub(crate) use mcp::McpClient;
-pub(crate) use mcp::ServerConfig;
+pub(crate) use mcp::{McpClient, McpTools, ServerConfig};
 use serde_json::{Value, json};
 
-pub(crate) fn definitions(mcp: &McpClient) -> Value {
+pub(crate) fn definitions(mcp: &McpTools) -> Value {
     let mut definitions = vec![function_definition(
         "echo",
         "原样返回给定的文字",
@@ -31,7 +30,11 @@ fn function_definition(name: &str, description: &str, parameters: impl serde::Se
     })
 }
 
-pub(crate) fn call(name: &str, arguments: &Value, mcp: &McpClient) -> Result<String, String> {
+pub(crate) fn supports_parallel(name: &str, mcp: &McpTools) -> bool {
+    name == "echo" || mcp.supports_parallel(name)
+}
+
+pub(crate) async fn call(name: &str, arguments: &Value, mcp: &McpTools) -> Result<String, String> {
     match name {
         "echo" => {
             let text = arguments["text"]
@@ -40,6 +43,6 @@ pub(crate) fn call(name: &str, arguments: &Value, mcp: &McpClient) -> Result<Str
 
             Ok(text.to_string())
         }
-        _ => mcp.call(name, arguments),
+        _ => mcp.call(name, arguments).await,
     }
 }

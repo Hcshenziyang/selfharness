@@ -1,4 +1,4 @@
-use super::config::ServerConfig;
+use super::config::TransportConfig;
 use reqwest::header::{HeaderName, HeaderValue};
 use rmcp::{
     RoleClient, ServiceExt,
@@ -14,10 +14,10 @@ use std::{collections::HashMap, env, error::Error};
 use tokio::process::Command;
 
 pub(super) async fn connect(
-    config: ServerConfig,
-) -> Result<RunningService<RoleClient, ()>, Box<dyn Error>> {
+    config: TransportConfig,
+) -> Result<RunningService<RoleClient, ()>, Box<dyn Error + Send + Sync>> {
     match config {
-        ServerConfig::Stdio {
+        TransportConfig::Stdio {
             command,
             args,
             env: extra_env,
@@ -40,7 +40,7 @@ pub(super) async fn connect(
             }
             Ok(().serve(TokioChildProcess::new(child)?).await?)
         }
-        ServerConfig::Http { url, headers } => {
+        TransportConfig::Http { url, headers } => {
             let parsed = reqwest::Url::parse(&url).map_err(|_| "MCP HTTP 地址无效")?;
             if !matches!(parsed.scheme(), "http" | "https") {
                 return Err("MCP HTTP 地址必须以 http 或 https 开头".into());
@@ -64,7 +64,7 @@ fn add_header(
     headers: &mut HashMap<HeaderName, HeaderValue>,
     name: &str,
     value: &str,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| "MCP HTTP 请求头名称无效")?;
     let mut value =
         HeaderValue::from_str(value).map_err(|_| format!("MCP 请求头 {name} 的值无效"))?;

@@ -24,6 +24,7 @@ class McpHandler(BaseHTTPRequestHandler):
             result = {"tools": [{
                 "name": "demo_code",
                 "description": "查询 HTTP MCP 测试暗号",
+                "annotations": {"readOnlyHint": True},
                 "inputSchema": {"type": "object", "properties": {}},
             }]}
         elif method == "tools/call" and request["params"]["name"] == "demo_code":

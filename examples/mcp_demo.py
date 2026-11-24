@@ -16,6 +16,7 @@ def handle(method, params):
             "tools": [{
                 "name": "demo_code",
                 "description": "查询本机 MCP 测试暗号",
+                "annotations": {"readOnlyHint": True},
                 "inputSchema": {"type": "object", "properties": {}},
             }]
         }

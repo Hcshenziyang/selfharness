@@ -1,5 +1,5 @@
 use crate::{config::Config, conversation::Message};
-use reqwest::blocking::Client;
+use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
 use std::error::Error;
@@ -14,7 +14,7 @@ struct ModelResponse {
 }
 
 // ***************************************请求 LLM***************************************
-pub(crate) fn ask_llm(
+pub(crate) async fn ask_llm(
     client: &Client,
     config: &Config,
     input: &[Message],
@@ -26,16 +26,19 @@ pub(crate) fn ask_llm(
         "stream": false,
         // 客户端每次回传完整历史，由本地 SQLite 保存会话。
         "store": false,
-        "tools": tool_definitions
+        "tools": tool_definitions,
+        "parallel_tool_calls": true
     });
 
     let response: ModelResponse = client
         .post(&config.model_url)
         .bearer_auth(&config.api_key)
         .json(&body)
-        .send()?
+        .send()
+        .await?
         .error_for_status()?
-        .json()?;
+        .json()
+        .await?;
 
     if let Some(error) = response.error {
         return Err(format!(
