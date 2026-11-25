@@ -1,4 +1,4 @@
-//! 一条网页消息从 [`chat`] 入队，由 [`AppState::run_queue`] 调用 [`agent_loop::run_turn`]。
+//! 网页通过 [`enqueue`] 提交消息，由 [`AppState::run_queue`] 调用 [`agent_loop::run_turn`]。
 //! 回合结束后，[`TurnQueues::finish`] 处理结果并取下一条消息。
 
 mod turns;
@@ -42,21 +42,39 @@ impl AppState {
     }
 
     /// 单个会话的后台任务。每次取队首都重新读取已提交的历史，然后执行一个用户回合。
-    async fn run_queue(self: Arc<Self>, id: i64, mut message: String) {
+    async fn run_queue(self: Arc<Self>, id: i64, mut work: turns::TurnWork) {
         loop {
             let result = match self.with_chats(|chats| chats.store.load(id)) {
-                Ok(conversation) => {
-                    agent_loop::run_turn(&self.model, conversation, &message, &self.mcp)
-                        .await
-                        .map_err(turn_error)
-                }
+                Ok(conversation) => tokio::select! {
+                    biased;
+                    _ = work.cancel.cancelled() => Err(turns::cancelled()),
+                    result = agent_loop::run_turn(&self.model, conversation, &work.message, &self.mcp) =>
+                        result.map_err(turn_error),
+                },
                 Err(error) => Err(database_error(error)),
             };
             match self.with_chats(|chats| chats.finish(id, result)) {
-                Some(next) => message = next,
+                Some(next) => work = next,
                 None => return,
             }
         }
+    }
+
+    /// 两种提交入口共用同一条 FIFO。只有原本为空的队列需要启动后台任务。
+    fn submit(
+        self: &Arc<Self>,
+        id: i64,
+        input: ChatInput,
+        reply: Option<oneshot::Sender<ApiResult>>,
+    ) -> Result<(), ApiError> {
+        let message = input.message.trim();
+        if message.is_empty() {
+            return Err(api_error(StatusCode::BAD_REQUEST, "请输入消息"));
+        }
+        if let Some(first) = self.with_chats(|chats| chats.enqueue(id, message.into(), reply))? {
+            self.workers.spawn(Arc::clone(self).run_queue(id, first));
+        }
+        Ok(())
     }
 }
 
@@ -82,16 +100,34 @@ pub(crate) async fn serve(
     });
     let app = Router::new()
         .route("/", get(index))
-        .route("/app.js", get(script))
-        .route("/style.css", get(style))
+        .route("/{file}", get(asset))
         .route(
             "/api/conversations",
             get(conversations).post(create_conversation),
         )
         .route("/api/conversations/{id}/messages", get(history).post(chat))
+        .route(
+            "/api/conversations/{id}",
+            axum::routing::patch(rename_conversation).delete(delete_conversation),
+        )
+        .route(
+            "/api/conversations/{id}/turns",
+            axum::routing::post(enqueue),
+        )
+        .route(
+            "/api/conversations/{id}/turns/{turn}",
+            axum::routing::delete(stop_turn),
+        )
         .route("/api/conversations/{id}/progress", get(progress))
         .route("/api/mcp/servers", get(servers).post(connect))
-        .route("/api/mcp/servers/{name}", axum::routing::delete(disconnect))
+        .route(
+            "/api/mcp/servers/{name}",
+            axum::routing::put(edit_server).delete(disconnect),
+        )
+        .route(
+            "/api/mcp/servers/{name}/reconnect",
+            axum::routing::post(reconnect),
+        )
         .layer(DefaultBodyLimit::max(64 * 1024))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
@@ -193,20 +229,19 @@ async fn index() -> impl IntoResponse {
     )
 }
 
-/// 返回聊天和 MCP 面板共用的浏览器脚本。
-async fn script() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-        include_str!("../web/app.js"),
-    )
-}
-
-/// 返回聊天页面的样式表。
-async fn style() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-        include_str!("../web/style.css"),
-    )
+/// 只提供编译时内嵌的前端文件，Markdown 解析也可以完全在本地运行。
+async fn asset(Path(file): Path<String>) -> Response {
+    let js = "text/javascript; charset=utf-8";
+    let (mime, content) = match file.as_str() {
+        "app.js" => (js, include_str!("../web/app.js")),
+        "ui.js" => (js, include_str!("../web/ui.js")),
+        "messages.js" => (js, include_str!("../web/messages.js")),
+        "mcp.js" => (js, include_str!("../web/mcp.js")),
+        "markdown-it.min.js" => (js, include_str!("../web/vendor/markdown-it.min.js")),
+        "style.css" => ("text/css; charset=utf-8", include_str!("../web/style.css")),
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    ([(header::CONTENT_TYPE, mime)], content).into_response()
 }
 
 // ******************************** 会话与聊天接口 ********************************
@@ -225,6 +260,36 @@ async fn create_conversation(State(state): State<Arc<AppState>>) -> ApiResult {
         .with_chats(|chats| chats.store.create())
         .map_err(database_error)?;
     Ok(Json(json!(info)))
+}
+
+#[derive(Deserialize)]
+struct RenameInput {
+    title: String,
+}
+
+/// 修改侧栏标题，保留原有消息。
+async fn rename_conversation(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Json(input): Json<RenameInput>,
+) -> ApiResult {
+    let title = input.title.trim();
+    if title.is_empty() {
+        return Err(api_error(StatusCode::BAD_REQUEST, "会话标题不能为空"));
+    }
+    let info = state
+        .with_chats(|chats| chats.store.rename(id, title))
+        .map_err(database_error)?;
+    Ok(Json(json!(info)))
+}
+
+/// 删除历史后，旧会话地址失效。
+async fn delete_conversation(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    state.with_chats(|chats| chats.delete_conversation(id))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// 在同一次加锁期间读取已保存的消息和内存中的进度，供打开或刷新会话时恢复页面。
@@ -259,18 +324,31 @@ async fn chat(
     Path(id): Path<i64>,
     Json(input): Json<ChatInput>,
 ) -> ApiResult {
-    let message = input.message.trim().to_string();
-    if message.is_empty() {
-        return Err(api_error(StatusCode::BAD_REQUEST, "请输入消息"));
-    }
     let (reply, result) = oneshot::channel();
-    if let Some(first) = state.with_chats(|chats| chats.enqueue(id, message, reply))? {
-        state.workers.spawn(Arc::clone(&state).run_queue(id, first));
-    }
+    state.submit(id, input, Some(reply))?;
     // HTTP 断开只会丢弃接收端。后台任务负责排完这个会话里已受理的消息。
     result
         .await
         .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "会话任务中断"))?
+}
+
+/// 网页只等待入队确认，随后通过历史和进度接口跟踪回合。
+async fn enqueue(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Json(input): Json<ChatInput>,
+) -> Result<StatusCode, ApiError> {
+    state.submit(id, input, None)?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+/// 停止指定回合，同会话排在后面的消息继续执行。
+async fn stop_turn(
+    State(state): State<Arc<AppState>>,
+    Path((id, turn)): Path<(i64, u64)>,
+) -> Result<StatusCode, ApiError> {
+    state.with_chats(|chats| chats.cancel(id, turn))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ******************************** MCP 服务管理接口 ********************************
@@ -306,5 +384,29 @@ async fn disconnect(State(state): State<Arc<AppState>>, Path(name): Path<String>
         .remove_server(&name)
         .await
         .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
+    servers(State(state)).await
+}
+
+/// 验证新配置并连接成功后才替换同名服务。
+async fn edit_server(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(config): Json<tools::ServerConfig>,
+) -> ApiResult {
+    state
+        .mcp
+        .replace_server(name, Some(config))
+        .await
+        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))?;
+    servers(State(state)).await
+}
+
+/// 用服务端保存的配置重连，凭据始终留在注册表内。
+async fn reconnect(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> ApiResult {
+    state
+        .mcp
+        .replace_server(name, None)
+        .await
+        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))?;
     servers(State(state)).await
 }

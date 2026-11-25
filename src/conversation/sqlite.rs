@@ -13,13 +13,24 @@ pub(crate) struct ConversationStore {
 impl ConversationStore {
     /// 打开本地数据库并初始化会话表、消息表及其外键约束。
     pub(crate) fn open(path: &Path) -> Result<Self> {
-        let db = Connection::open(path)?;
-        db.execute_batch(
+        let mut db = Connection::open(path)?;
+        // 旧表的主键会复用已删除的 ID。迁移时让 messages 的外键继续指向正式表名。
+        db.execute_batch("PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = ON;")?;
+        let tx = db.transaction()?;
+        let old_schema: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('conversations')
+             WHERE name = 'title' AND \"notnull\" = 1)",
+            [],
+            |row| row.get(0),
+        )?;
+        if old_schema {
+            tx.execute_batch("ALTER TABLE conversations RENAME TO conversations_old;")?;
+        }
+        tx.execute_batch(
             "
-            PRAGMA foreign_keys = ON;
             CREATE TABLE IF NOT EXISTS conversations (
-                id INTEGER PRIMARY KEY,
-                title TEXT NOT NULL DEFAULT '新对话',
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now'))
             );
@@ -33,13 +44,24 @@ impl ConversationStore {
             );
         ",
         )?;
+        if old_schema {
+            tx.execute_batch(
+                "INSERT INTO conversations (id, title, created_at, updated_at)
+                SELECT id, CASE WHEN title = '新对话' AND NOT EXISTS
+                    (SELECT 1 FROM messages WHERE conversation_id = c.id) THEN NULL ELSE title END,
+                    created_at, updated_at FROM conversations_old c;
+                DROP TABLE conversations_old;",
+            )?;
+        }
+        tx.commit()?;
+        db.execute_batch("PRAGMA legacy_alter_table = OFF; PRAGMA foreign_keys = ON;")?;
         Ok(Self { db })
     }
 
     /// 创建一个空会话，返回网页后续发送消息时使用的 ID 和初始标题。
     pub(crate) fn create(&self) -> Result<ConversationInfo> {
         self.db.query_row(
-            "INSERT INTO conversations DEFAULT VALUES RETURNING id, title",
+            "INSERT INTO conversations DEFAULT VALUES RETURNING id, coalesce(title, '新对话')",
             [],
             conversation_info,
         )
@@ -48,7 +70,7 @@ impl ConversationStore {
     /// 按最近更新时间列出会话，时间相同时将 ID 较大的排在前面。
     pub(crate) fn list(&self) -> Result<Vec<ConversationInfo>> {
         self.db
-            .prepare("SELECT id, title FROM conversations ORDER BY updated_at DESC, id DESC")?
+            .prepare("SELECT id, coalesce(title, '新对话') FROM conversations ORDER BY updated_at DESC, id DESC")?
             .query_map([], conversation_info)?
             .collect()
     }
@@ -56,10 +78,29 @@ impl ConversationStore {
     /// 按 ID 查会话标题，找不到时返回数据库查询错误。
     pub(crate) fn info(&self, id: i64) -> Result<ConversationInfo> {
         self.db.query_row(
-            "SELECT id, title FROM conversations WHERE id = ?1",
+            "SELECT id, coalesce(title, '新对话') FROM conversations WHERE id = ?1",
             [id],
             conversation_info,
         )
+    }
+
+    /// 显式标题优先于首轮自动生成的标题，包括首轮仍在运行时的改名。
+    pub(crate) fn rename(&self, id: i64, title: &str) -> Result<ConversationInfo> {
+        self.db.query_row(
+            "UPDATE conversations SET title = ?2 WHERE id = ?1 RETURNING id, title",
+            params![id, title],
+            conversation_info,
+        )
+    }
+
+    /// 在同一事务中移除消息和会话。旧页面持有的 ID 不会再分配给新会话。
+    pub(crate) fn delete(&mut self, id: i64) -> Result<()> {
+        let tx = self.db.transaction()?;
+        tx.execute("DELETE FROM messages WHERE conversation_id = ?1", [id])?;
+        if tx.execute("DELETE FROM conversations WHERE id = ?1", [id])? == 0 {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
+        tx.commit()
     }
 
     // ******************************** 读取历史与保存回合 ********************************
@@ -115,7 +156,7 @@ impl ConversationStore {
             None
         };
         let info = transaction.query_row(
-            "UPDATE conversations SET title = coalesce(substr(?1, 1, 40), title),
+            "UPDATE conversations SET title = coalesce(title, substr(?1, 1, 40), '新对话'),
                 updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now')
              WHERE id = ?2 RETURNING id, title",
             params![first_question, conversation.info.id],

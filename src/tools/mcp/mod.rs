@@ -27,6 +27,8 @@ struct McpTool {
 /// 一个已注册的服务及其公布的工具，持有连接直到服务断开。
 struct McpServer {
     service: RunningService<RoleClient, ()>,
+    // 仅驻留在服务端内存，供重连使用。
+    config: ServerConfig,
     transport: &'static str,
     tools: BTreeMap<String, Arc<McpTool>>,
 }
@@ -60,12 +62,36 @@ impl McpClient {
         if self.servers.read().await.contains_key(&name) {
             return Err(format!("MCP 服务 {name} 已存在").into());
         }
+        self.connect_server(name, config).await
+    }
+
+    /// 替换现有服务。没有新配置时，用已有配置重新握手。
+    pub(crate) async fn replace_server(
+        &self,
+        name: String,
+        replacement: Option<ServerConfig>,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let _change = self.connection_changes.lock().await;
+        let config = {
+            let servers = self.servers.read().await;
+            let current = servers.get(&name).ok_or("MCP 服务不存在")?;
+            replacement.unwrap_or_else(|| current.config.clone())
+        };
+        self.connect_server(name, config).await
+    }
+
+    /// 在注册表之外完成握手，验证工具名后一次替换连接。失败时仍保留原服务。
+    async fn connect_server(
+        &self,
+        name: String,
+        config: ServerConfig,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let transport_name = match &config.transport {
             config::TransportConfig::Stdio { .. } => "stdio",
             config::TransportConfig::Http { .. } => "http",
         };
         let (service, remote_tools) = timeout(Duration::from_secs(15), async {
-            let service = transport::connect(config.transport).await?;
+            let service = transport::connect(config.transport.clone()).await?;
             let tools = service.list_all_tools().await?;
             Ok::<_, Box<dyn Error + Send + Sync>>((service, tools))
         })
@@ -92,8 +118,8 @@ impl McpClient {
             if suffix.is_empty()
                 || tool_name.len() > 64
                 || servers
-                    .values()
-                    .any(|server| server.tools.contains_key(&tool_name))
+                    .iter()
+                    .any(|(other, server)| other != &name && server.tools.contains_key(&tool_name))
                 || new_tools.contains_key(&tool_name)
             {
                 return Err(format!("MCP 工具无法使用名称 {tool_name}").into());
@@ -116,14 +142,22 @@ impl McpClient {
                 }),
             );
         }
-        servers.insert(
+        let previous = servers.insert(
             name,
             McpServer {
                 service,
+                config,
                 transport: transport_name,
                 tools: new_tools,
             },
         );
+        drop(servers);
+        if let Some(mut previous) = previous {
+            let _ = previous
+                .service
+                .close_with_timeout(Duration::from_secs(2))
+                .await;
+        }
         Ok(())
     }
 

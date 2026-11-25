@@ -406,6 +406,110 @@ class WebIntegration(unittest.TestCase):
         self.assertEqual(self.server.state["requests"][-1]["input"][0]["content"], "A1")
         self.assertEqual(self.request(b, "POST", {"message": "B1"})[0], 200)
 
+    def test_web_admission_stop_and_rename(self):
+        """受理后可继续排队；停止队首和撤回指定排队项不会丢掉后续消息或改名。"""
+        entered, release = threading.Event(), threading.Event()
+
+        def model(request):
+            if request["input"][-1]["content"] == "慢回复":
+                entered.set()
+                release.wait(8)
+            return model_text()
+
+        self.server.state["model_output"] = model
+        path = self.new_conversation()
+        base = path.removesuffix("/messages")
+        try:
+            for text in ("慢回复", "撤回", "保留"):
+                self.assertEqual(self.request(base + "/turns", "POST", {"message": text})[0], 202)
+            self.assertTrue(entered.wait(3))
+            turns = self.request(path)[1]["progress"]["turns"]
+            self.assertEqual([t["status"] for t in turns], ["running", "queued", "queued"])
+            self.assertEqual(self.request(base, "DELETE")[0], 409)
+            self.assertEqual(self.request(base, "PATCH", {"title": "我的标题"})[0], 200)
+            for turn in (turns[1], turns[0]):
+                self.assertEqual(self.request(f"{base}/turns/{turn['id']}", "DELETE")[0], 204)
+            self.wait_progress(path, lambda p: not p["turns"])
+            snapshot = self.request(path)[1]
+            self.assertEqual(snapshot["conversation"]["title"], "我的标题")
+            self.assertEqual([m["content"] for m in snapshot["messages"]], ["保留", "完成"])
+            self.assertIsNone(snapshot["progress"]["last_failure"])
+        finally:
+            release.set()
+
+    def test_stop_while_waiting_for_an_external_tool(self):
+        """外部工具已经收到调用时，停止本轮可以立即运行队列下一项。"""
+        entered, release = threading.Event(), threading.Event()
+
+        def tool(_name):
+            entered.set()
+            release.wait(8)
+            return {"content": [{"type": "text", "text": "工具结果"}]}
+
+        def model(request):
+            if request["input"][-1].get("content") == "慢工具":
+                return model_call("mcp__remote__slow", "call_slow")
+            return model_text()
+
+        self.connect_test_tools({"slow": None}, tool)
+        self.server.state["model_output"] = model
+        path = self.new_conversation()
+        turns = path.removesuffix("messages") + "turns"
+        connection = self.submit_connection(path, "慢工具")
+        try:
+            self.assertTrue(entered.wait(5))
+            turn = self.request(path)[1]["progress"]["turns"][0]
+            self.assertEqual(self.request(turns, "POST", {"message": "继续"})[0], 202)
+            self.assertEqual(self.request(f"{turns}/{turn['id']}", "DELETE")[0], 204)
+            self.assertEqual(connection.getresponse().status, 409)
+            self.wait_progress(path, lambda p: not p["turns"])
+            self.assertEqual([m["content"] for m in self.request(path)[1]["messages"]], ["继续", "完成"])
+        finally:
+            release.set()
+
+    def test_delete_after_upgrading_history(self):
+        """旧数据库保留消息和关联，删除会话后旧 URL 不会指向后来创建的新会话。"""
+        self.stop_app()
+        with sqlite3.connect(self.db_path) as db:
+            db.executescript("""
+                DROP TABLE conversations;
+                CREATE TABLE conversations (id INTEGER PRIMARY KEY, title TEXT NOT NULL DEFAULT '新对话',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+                INSERT INTO conversations (id, title) VALUES (24, '原有标题');
+            """)
+            db.execute("INSERT INTO messages (conversation_id, position, payload) VALUES (24, 0, ?)",
+                       (json.dumps({"role": "user", "content": "历史正文"}),))
+        self.start_app()
+        base = "/api/conversations/24"
+        data = self.request(base + "/messages")[1]
+        self.assertEqual(data["messages"][0]["content"], "历史正文")
+        self.assertEqual(data["conversation"]["title"], "原有标题")
+        with sqlite3.connect(self.db_path) as db:
+            self.assertEqual(db.execute("PRAGMA foreign_key_list(messages)").fetchone()[2], "conversations")
+            self.assertFalse(db.execute("PRAGMA foreign_key_check").fetchall())
+        self.assertEqual(self.request(base, "DELETE")[0], 204)
+        self.assertNotEqual(self.new_conversation(), base + "/messages")
+        self.assertEqual(self.request(base + "/messages")[0], 404)
+        with sqlite3.connect(self.db_path) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM messages WHERE conversation_id=24").fetchone()[0], 0)
+
+    def test_mcp_edit_and_reconnect(self):
+        """失败的配置替换保留原服务；重连沿用已有凭据，列表不返回凭据。"""
+        path = "/api/mcp/servers/remote"
+        config = {"type": "http", "url": f"http://127.0.0.1:{self.server.server_port}/mcp",
+                  "headers": {"Authorization": "Bearer test-token", "X-Test": "test-header"}}
+        self.assertEqual(self.request("/api/mcp/servers", "POST", {**config, "name": "remote"})[0], 200)
+        self.assertEqual(self.request(path, "PUT", {**config, "url": "invalid"})[0], 400)
+        status, data = self.request(path + "/reconnect", "POST")
+        self.assertEqual(status, 200, data)
+        self.assertTrue(data["servers"][0]["connected"])
+        self.server.state["mcp_tools"] = [{"name": "edited", "inputSchema": {"type": "object"}}]
+        status, data = self.request(path, "PUT", {**config, "supports_parallel_tool_calls": True})
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["servers"][0]["tools"], ["mcp__remote__edited"])
+        self.assertNotIn("test-token", json.dumps(data))
+        self.assertFalse(self.server.state["errors"])
+
     def test_failure_can_be_recovered_by_multiple_tabs(self):
         """多个页面均可恢复失败原文和原因，重新发消息后清除旧错误，上游限流返回 429。"""
         entered, release = threading.Event(), threading.Event()

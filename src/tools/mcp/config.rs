@@ -4,7 +4,7 @@ use std::{collections::BTreeMap, error::Error, path::PathBuf};
 // ******************************** 服务连接配置 ********************************
 
 /// 网页提交的 MCP 服务配置。并发选项与传输字段位于同一层 JSON。
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub(crate) struct ServerConfig {
     /// 显式允许整个服务的工具并发调用，缺省为 false。
     #[serde(default)]
@@ -14,7 +14,7 @@ pub(crate) struct ServerConfig {
 }
 
 /// Serde 根据 type 选择 stdio 或 http，并拒绝该传输方式无法识别的字段。
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum TransportConfig {
     /// 启动本地子进程。args 和 env 缺省为空，cwd 缺省时沿用当前目录。

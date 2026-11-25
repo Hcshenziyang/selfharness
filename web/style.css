@@ -158,7 +158,15 @@ h1, h2, h3, h4, p, ul, ol {
   user-select: none;
 }
 
+.sidebar-heading {
+  display: flex;
+  align-items: center;
+  padding-right: 8px;
+  border-bottom: 1px solid var(--sidebar-border-subtle);
+}
+
 .brand {
+  flex: 1;
   display: flex;
   align-items: center;
   gap: 10px;
@@ -168,7 +176,6 @@ h1, h2, h3, h4, p, ul, ol {
   font-weight: 700;
   font-size: 0.95rem;
   letter-spacing: -0.015em;
-  border-bottom: 1px solid var(--sidebar-border-subtle);
   transition: opacity var(--duration-fast) var(--ease-smooth);
 }
 
@@ -207,6 +214,8 @@ h1, h2, h3, h4, p, ul, ol {
   display: flex;
   flex-direction: column;
 }
+
+.sidebar-section > * { flex-shrink: 0; }
 
 .sidebar-section::-webkit-scrollbar {
   width: 5px;
@@ -255,8 +264,6 @@ h1, h2, h3, h4, p, ul, ol {
 }
 
 .conversation-list {
-  max-height: 32vh;
-  overflow-y: auto;
   margin-bottom: 16px;
 }
 
@@ -288,40 +295,20 @@ h1, h2, h3, h4, p, ul, ol {
 }
 
 /* ******************************** MCP 连接表单 ******************************** */
-.form-reveal {
-  display: grid;
-  grid-template-rows: 0fr;
-  transition: grid-template-rows 0.3s var(--ease-spring);
-  overflow: hidden;
-}
-
-.form-reveal.open {
-  grid-template-rows: 1fr;
-}
-
-.form-reveal-inner {
-  min-height: 0;
-  overflow: hidden;
-  transition: opacity 0.25s var(--ease-smooth), transform 0.25s var(--ease-spring);
-  opacity: 0;
-  transform: translateY(-6px);
-}
-
-.form-reveal.open .form-reveal-inner {
-  opacity: 1;
-  transform: translateY(0);
-}
-
-/* 服务连接字段 */
-.server-form {
-  padding: 12px;
-  margin: 8px 0;
+#server-dialog {
+  width: min(520px, calc(100vw - 32px));
+  max-height: calc(100dvh - 40px);
+  padding: 0;
   border: 1px solid var(--sidebar-border);
-  border-radius: var(--radius-md);
-  background: var(--sidebar-surface);
+  border-radius: var(--radius-lg);
+  background: var(--sidebar-bg);
   color: var(--sidebar-text);
-  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.2);
+  box-shadow: var(--shadow-lg);
 }
+
+#server-dialog::backdrop { background: rgba(46, 38, 31, 0.5); }
+.server-form { padding: 20px 24px; }
+.edit-hint { font-size: 0.85rem; color: var(--sidebar-text-muted); }
 
 .form-heading {
   display: flex;
@@ -330,8 +317,8 @@ h1, h2, h3, h4, p, ul, ol {
   margin-bottom: 12px;
 }
 
-.form-heading h3 {
-  font-size: 0.86rem;
+.form-heading h2 {
+  font-size: 1.08rem;
   font-weight: 650;
   color: var(--sidebar-text);
 }
@@ -412,46 +399,6 @@ h1, h2, h3, h4, p, ul, ol {
   pointer-events: none;
 }
 
-/* 侧栏底部的本地运行状态 */
-.sidebar-footer {
-  padding: 12px 16px;
-  border-top: 1px solid var(--sidebar-border-subtle);
-  background: rgba(0, 0, 0, 0.08);
-}
-
-.status-indicator {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 0.76rem;
-  color: var(--sidebar-text-muted);
-}
-
-.status-pulse {
-  position: relative;
-  width: 7px;
-  height: 7px;
-  background: var(--success);
-  border-radius: 50%;
-  box-shadow: 0 0 6px rgba(82, 131, 103, 0.5);
-}
-
-.status-pulse::after {
-  content: "";
-  position: absolute;
-  inset: -3px;
-  border-radius: 50%;
-  border: 1.5px solid var(--success);
-  opacity: 0;
-  animation: pulse-ring 2.5s cubic-bezier(0.2, 0, 0, 1) infinite;
-}
-
-@keyframes pulse-ring {
-  0% { opacity: 0.7; transform: scale(0.8); }
-  60% { opacity: 0; transform: scale(1.8); }
-  100% { opacity: 0; transform: scale(2); }
-}
-
 /* ******************************** MCP 服务卡片与工具清单 ******************************** */
 .servers {
   display: flex;
@@ -482,13 +429,6 @@ h1, h2, h3, h4, p, ul, ol {
 .server-card:hover {
   border-color: var(--sidebar-border-subtle);
   background: var(--sidebar-hover);
-}
-
-.server-row {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 8px;
 }
 
 .server-meta-line {
@@ -534,7 +474,8 @@ h1, h2, h3, h4, p, ul, ol {
 }
 
 .server-tools-toggle {
-  display: inline-flex;
+  cursor: pointer;
+  display: list-item;
   align-items: center;
   gap: 4px;
   margin-top: 6px;
@@ -551,27 +492,13 @@ h1, h2, h3, h4, p, ul, ol {
   background: rgba(255, 255, 255, 0.06);
 }
 
-.server-tools-toggle svg {
-  transition: transform var(--duration-fast) var(--ease-spring);
-}
-
-.server-tools-toggle.expanded svg {
-  transform: rotate(90deg);
-}
-
 .server-tools-list {
-  display: none;
   padding: 6px 0 2px 4px;
   margin: 0;
   list-style: none;
   font-size: 0.72rem;
   color: var(--sidebar-text-muted);
   line-height: 1.5;
-}
-
-.server-tools-list.expanded {
-  display: block;
-  animation: fade-slide-down 0.2s var(--ease-smooth);
 }
 
 .server-tools-list li {
@@ -582,12 +509,9 @@ h1, h2, h3, h4, p, ul, ol {
   word-break: break-all;
 }
 
-.server-tools-list li svg {
-  color: var(--sidebar-text-dim);
-  flex-shrink: 0;
-}
+.server-actions { display: flex; gap: 6px; margin-top: 6px; }
 
-.server-remove {
+.server-action {
   font-size: 0.72rem;
   color: var(--sidebar-text-dim);
   padding: 3px 6px;
@@ -596,7 +520,12 @@ h1, h2, h3, h4, p, ul, ol {
   flex-shrink: 0;
 }
 
-.server-remove:hover:not(:disabled) {
+.server-action:hover:not(:disabled) {
+  color: var(--sidebar-text);
+  background: var(--sidebar-surface);
+}
+
+.server-action:last-child:hover:not(:disabled) {
   color: #ff7d7d;
   background: rgba(255, 125, 125, 0.12);
 }
@@ -622,8 +551,6 @@ h1, h2, h3, h4, p, ul, ol {
   padding: 0 24px;
   border-bottom: 1px solid var(--border-subtle);
   background: var(--bg-secondary);
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
   z-index: 10;
 }
 
@@ -644,6 +571,18 @@ h1, h2, h3, h4, p, ul, ol {
   color: var(--text-primary);
 }
 
+.chat-header-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+.conversation-menu { position: relative; }
+.conversation-menu summary { list-style: none; cursor: pointer; }
+.conversation-menu summary::-webkit-details-marker { display: none; }
+.menu-items {
+  position: absolute; right: 0; top: 100%; min-width: 110px; padding: 4px;
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-md);
+}
+.menu-items button { display: block; width: 100%; padding: 6px; text-align: left; }
+.menu-items button:hover { background: var(--bg-hover); }
+
 #new-chat {
   flex-shrink: 0;
 }
@@ -661,7 +600,6 @@ h1, h2, h3, h4, p, ul, ol {
   flex: 1;
   overflow-y: auto;
   overflow-x: hidden;
-  scroll-behavior: smooth;
   padding: 0;
 }
 
@@ -695,16 +633,7 @@ h1, h2, h3, h4, p, ul, ol {
   box-shadow: var(--shadow-md);
   z-index: 15;
   cursor: pointer;
-  opacity: 0;
-  transform: translateY(10px) scale(0.9);
-  pointer-events: none;
-  transition: all var(--duration-normal) var(--ease-spring);
-}
-
-.scroll-fab.visible {
-  opacity: 1;
-  transform: translateY(0) scale(1);
-  pointer-events: auto;
+  transition: transform var(--duration-fast), box-shadow var(--duration-fast);
 }
 
 .scroll-fab:hover {
@@ -823,6 +752,7 @@ h1, h2, h3, h4, p, ul, ol {
 
 /* 气泡及其操作按钮的布局 */
 .bubble-wrap {
+  min-width: 0;
   display: flex;
   flex-direction: column;
   max-width: min(85%, 620px);
@@ -830,6 +760,7 @@ h1, h2, h3, h4, p, ul, ol {
 }
 
 .message.user .bubble-wrap {
+  min-width: 0;
   align-items: flex-end;
 }
 
@@ -851,6 +782,7 @@ h1, h2, h3, h4, p, ul, ol {
 }
 
 .message.user .bubble {
+  white-space: pre-wrap;
   background: var(--bubble-user-bg);
   border-radius: var(--radius-lg) 2px var(--radius-lg) var(--radius-lg);
   color: var(--bubble-user-text);
@@ -897,7 +829,23 @@ h1, h2, h3, h4, p, ul, ol {
   color: inherit;
 }
 
-/* 悬停在助手消息上时显示复制按钮 */
+/* Markdown 正文和代码块的操作行 */
+.bubble :is(ul, ol) { padding-inline-start: 1.6em; }
+.bubble blockquote { margin: 0.5em 0; padding-left: 0.8em; border-left: 3px solid var(--border); }
+.bubble :is(h1, h2, h3, h4, h5, h6) { margin: 0.5em 0 0.2em; line-height: 1.35; }
+.bubble h1 { font-size: 1.4em; }
+.bubble h2 { font-size: 1.25em; }
+.bubble a { color: var(--teal-accent); }
+.bubble > :first-child { margin-top: 0; }
+.bubble table { display: block; overflow-x: auto; border-collapse: collapse; }
+.bubble :is(th, td) { border: 1px solid var(--border); padding: 2px 6px; }
+.code-block { margin: 8px 0; background: #2b241e; color: #ded2bf; border-radius: var(--radius-sm); }
+.code-heading { display: flex; justify-content: space-between; align-items: center; padding: 4px 10px; border-bottom: 1px solid #514941; font: 0.76rem var(--font-mono); }
+.code-heading .btn-bubble-action { color: inherit; }
+.code-heading .btn-bubble-action:hover { color: #fff; background: #514941; }
+.code-block pre { margin: 0; }
+
+/* 鼠标悬停、键盘聚焦和触屏设备都能发现复制按钮。 */
 .message-actions {
   display: flex;
   align-items: center;
@@ -907,7 +855,8 @@ h1, h2, h3, h4, p, ul, ol {
   transition: opacity var(--duration-fast) var(--ease-smooth);
 }
 
-.message:hover .message-actions {
+.message:hover .message-actions,
+.message:focus-within .message-actions {
   opacity: 1;
 }
 
@@ -932,42 +881,12 @@ h1, h2, h3, h4, p, ul, ol {
   flex-shrink: 0;
 }
 
-/* 等待回复时的圆点动画 */
+/* 回合进度与操作 */
 .message.pending .bubble {
   display: flex;
   align-items: center;
   gap: 6px;
   padding: 12px 16px;
-}
-
-.typing-dots {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-}
-
-.typing-dot {
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  background: var(--text-muted);
-  animation: typing-wave 1.4s infinite ease-in-out both;
-}
-
-.typing-dot:nth-child(1) { animation-delay: -0.32s; }
-.typing-dot:nth-child(2) { animation-delay: -0.16s; }
-.typing-dot:nth-child(3) { animation-delay: 0s; }
-
-@keyframes typing-wave {
-  0%, 80%, 100% {
-    transform: scale(0.7);
-    opacity: 0.4;
-  }
-  40% {
-    transform: scale(1.15);
-    opacity: 1;
-    background: var(--accent);
-  }
 }
 
 /* ******************************** 聊天输入区 ******************************** */
@@ -1225,10 +1144,24 @@ h1, h2, h3, h4, p, ul, ol {
   transition: opacity 0.25s var(--ease-smooth);
 }
 
+@media (hover: none), (any-pointer: coarse) {
+  .message-actions { opacity: 1; }
+  .btn-bubble-action { min-height: 28px; }
+}
+
+@media (min-width: 769px) {
+  .sidebar-overlay { display: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}
+
 /* ******************************** 窄屏布局 ******************************** */
 @media (max-width: 768px) {
   .sidebar {
     position: fixed;
+    max-width: calc(100vw - 40px);
     left: 0;
     top: 0;
     bottom: 0;
