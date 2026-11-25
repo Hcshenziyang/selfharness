@@ -5,7 +5,7 @@ pub(crate) use config::ServerConfig;
 use rmcp::{
     RoleClient,
     model::{CallToolRequest, CallToolRequestParams, ServerResult},
-    service::{Peer, PeerRequestOptions, RunningService},
+    service::{Peer, PeerRequestOptions, RunningService, ServiceError},
 };
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, error::Error, sync::Arc, time::Duration};
@@ -14,6 +14,9 @@ use tokio::{
     time::timeout,
 };
 
+// ******************************** 已连接的服务与工具 ********************************
+
+/// 一项 MCP 工具，保存模型看到的定义，以及向原服务发起调用所需的连接和原名。
 struct McpTool {
     peer: Peer<RoleClient>,
     original_name: String,
@@ -21,6 +24,7 @@ struct McpTool {
     supports_parallel: bool,
 }
 
+/// 一个已注册的服务及其公布的工具，持有连接直到服务断开。
 struct McpServer {
     service: RunningService<RoleClient, ()>,
     transport: &'static str,
@@ -28,25 +32,24 @@ struct McpServer {
 }
 
 impl McpServer {
+    /// 同时检查 MCP 会话和底层传输，任一关闭都视为已断开。
     fn connected(&self) -> bool {
         !self.service.is_closed() && !self.service.peer().is_transport_closed()
     }
 }
 
-// 每轮保留当时公布给模型的工具和连接，执行时不占服务表的锁。
-pub(crate) struct McpTools {
-    by_name: BTreeMap<String, Arc<McpTool>>,
-}
+// ******************************** 服务注册与连接管理 ********************************
 
+/// 所有会话共享的 MCP 客户端，负责连接、断开服务和生成可用工具快照。
 #[derive(Default)]
 pub(crate) struct McpClient {
     servers: RwLock<BTreeMap<String, McpServer>>,
-    // 连接与断开按顺序完成，避免重复启动同名子进程。正在执行的回合持有自己的工具清单。
-    connection_changes: Mutex<()>,
+    // 连接与断开按顺序完成，避免重复启动同名子进程。
+    connection_changes: Mutex<()>, // mutex 互斥锁，同一时间只允许一个连接或断开操作
 }
 
 impl McpClient {
-    /// Add a new server to the McpClient, given a name and a ServerConfig.
+    /// 连接服务并获取完整工具清单。所有工具名校验通过后，才将整批工具发布给模型。
     pub(crate) async fn add_server(
         &self,
         name: String,
@@ -69,10 +72,12 @@ impl McpClient {
         .await
         .map_err(|_| format!("MCP 服务 {name} 握手或获取工具清单超时"))?
         .map_err(|error| format!("MCP 服务 {name} 连接失败：{error}"))?;
+
         let mut servers = self.servers.write().await;
         let mut new_tools = BTreeMap::new();
         for tool in remote_tools {
             let original_name = tool.name.into_owned();
+            // 对模型使用带服务前缀的名称，同名工具可以来自不同服务。发给 MCP 时还原原名。
             let suffix: String = original_name
                 .chars()
                 .map(|ch| {
@@ -122,7 +127,7 @@ impl McpClient {
         Ok(())
     }
 
-    /// Return a list of all servers, with their name, type, connection status, and tools
+    /// 列出供网页展示的服务名称、传输方式、实时连接状态和工具名。
     pub(crate) async fn servers(&self) -> Vec<Value> {
         self.servers
             .read()
@@ -135,7 +140,7 @@ impl McpClient {
             .collect()
     }
 
-    /// Remove a server
+    /// 先从注册表移除服务，再尝试关闭原连接。此后取得的工具快照会排除该服务。
     pub(crate) async fn remove_server(&self, name: &str) -> Result<(), &'static str> {
         let _change = self.connection_changes.lock().await;
         let mut server = self
@@ -151,6 +156,7 @@ impl McpClient {
         Ok(())
     }
 
+    /// 收集当前仍连接的工具，供下一次请求模型和执行其返回的调用共同使用。
     pub(crate) async fn tools(&self) -> McpTools {
         let servers = self.servers.read().await;
         let mut by_name = BTreeMap::new();
@@ -162,6 +168,7 @@ impl McpClient {
         McpTools { by_name }
     }
 
+    /// 服务端退出时取走注册表里的所有连接，并逐个关闭。
     pub(crate) async fn shutdown(&self) {
         let servers = std::mem::take(&mut *self.servers.write().await);
         for mut server in servers.into_values() {
@@ -173,19 +180,27 @@ impl McpClient {
     }
 }
 
+// ******************************** 通过快照调用工具 ********************************
+
+/// 一次模型请求的工具快照。同一批工具调用沿用当时公布的连接，无需持有服务表的锁。
+pub(crate) struct McpTools {
+    by_name: BTreeMap<String, Arc<McpTool>>,
+}
+
 impl McpTools {
-    /// Return an iterator(迭代器) over the tool definitions advertised for this turn.
+    /// 返回工具定义的迭代器，供上层组装本次模型请求的工具清单。
     pub(super) fn definitions(&self) -> impl Iterator<Item = &Value> {
         self.by_name.values().map(|tool| &tool.definition)
     }
 
+    /// 查询指定工具的并发标记，来源是服务配置或工具声明的只读提示。
     pub(super) fn supports_parallel(&self, name: &str) -> bool {
         self.by_name
             .get(name)
             .is_some_and(|tool| tool.supports_parallel)
     }
 
-    /// Call a tool by name with the given arguments
+    /// 找到模型指定的工具并通过快照中的连接调用它。成功时优先返回结构化 JSON，其次是文本。
     pub(super) async fn call(&self, name: &str, arguments: &Value) -> Result<String, String> {
         let tool = self
             .by_name
@@ -198,7 +213,9 @@ impl McpTools {
             CallToolRequestParams::new(tool.original_name.clone())
                 .with_arguments(arguments.clone()),
         );
-        let call_error = |error| format!("MCP 调用失败：{error}");
+        if tool.peer.is_transport_closed() {
+            return Err("MCP 服务已断开，工具调用未发出".into());
+        }
         let pending = tool
             .peer
             .send_cancellable_request(
@@ -206,8 +223,18 @@ impl McpTools {
                 PeerRequestOptions::with_timeout(Duration::from_secs(30)),
             )
             .await
-            .map_err(call_error)?;
-        let reply = pending.await_response().await.map_err(call_error)?;
+            .map_err(|error| match error {
+                ServiceError::TransportClosed => "MCP 服务已断开，工具调用未发出".into(),
+                _ => format!("MCP 工具调用未发出：{error}"),
+            })?;
+        // 已提交的调用可能在远端执行。此后等待超时或断线，无法据此判断工具是否成功。
+        let reply = pending
+            .await_response()
+            .await
+            .map_err(|error| match error {
+                ServiceError::McpError(_) => format!("MCP 调用失败：{error}"),
+                _ => format!("MCP 工具执行结果未知：{error}。重试前请先核实执行情况"),
+            })?;
         let ServerResult::CallToolResult(result) = reply else {
             return Err("MCP 服务未返回工具结果".into());
         };

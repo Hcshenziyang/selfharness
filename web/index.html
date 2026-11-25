@@ -10,7 +10,7 @@
 </head>
 <body>
   <div class="app-shell">
-    <!-- ─── Sidebar ─── -->
+    <!-- ******************************** 会话导航与 MCP 服务 ******************************** -->
     <nav class="sidebar">
       <a class="brand" href="/" aria-label="DogOHarness 首页">
         <div class="brand-logo" aria-hidden="true">
@@ -36,7 +36,7 @@
           <span class="sidebar-action-text">添加服务</span>
         </button>
 
-        <!-- Form with smooth height reveal -->
+        <!-- 连接表单按传输方式切换本地进程或 HTTP 所需的字段。 -->
         <div id="server-form-reveal" class="form-reveal">
           <div class="form-reveal-inner" inert>
             <form id="server-form" class="server-form">
@@ -94,7 +94,7 @@
       </div>
     </nav>
 
-    <!-- ─── Chat Area ─── -->
+    <!-- ******************************** 聊天与消息输入 ******************************** -->
     <main class="chat-area">
       <header class="chat-header">
         <div class="chat-header-left">
@@ -109,6 +109,7 @@
         </button>
       </header>
 
+      <!-- app.js 在这里渲染历史消息、等待回复的气泡和排队提示。 -->
       <div class="chat-scroll-wrap">
         <div id="chat-scroll" class="chat-scroll" aria-live="polite">
           <div id="empty-chat" class="empty-chat">

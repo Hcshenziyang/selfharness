@@ -5,8 +5,13 @@ import json
 import sys
 
 
+# ******************************** HTTP 上的 MCP 请求 ********************************
+
 class McpHandler(BaseHTTPRequestHandler):
+    """提供握手、工具清单和 demo_code 调用的本地 HTTP 处理器。"""
+
     def do_POST(self):
+        """按请求 ID 返回 JSON-RPC 结果，无 ID 的通知以 HTTP 202 确认接收。"""
         request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         if "id" not in request:
             self.send_response(202)
@@ -37,11 +42,12 @@ class McpHandler(BaseHTTPRequestHandler):
         self.send_json({"jsonrpc": "2.0", "id": request["id"], "result": result})
 
     def do_GET(self):
-        # 这个演示服务不提供服务器主动推送。
+        """此示例仅通过 POST 回包，GET 请求以 405 表示未提供推送流。"""
         self.send_response(405)
         self.end_headers()
 
     def send_json(self, body):
+        """将 JSON-RPC 回包编码成字节，并据此设置 HTTP 正文长度。"""
         data = json.dumps(body).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -49,6 +55,8 @@ class McpHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+
+# ******************************** 本地服务入口 ********************************
 
 if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8765

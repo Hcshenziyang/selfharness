@@ -1,10 +1,12 @@
 """模拟模型和 HTTP MCP，测试网页接口实际连接和工具调用。"""
 
 from concurrent.futures import ThreadPoolExecutor
+from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
 import json
 import os
 import select
@@ -22,7 +24,21 @@ BINARY = sys.argv.pop(1)
 ROOT = Path(__file__).resolve().parent.parent
 
 
+# ******************************** 模拟模型与 HTTP MCP 服务 ********************************
+
+def model_text(text="完成"):
+    """构造模型完成回复时返回的 Responses 文本输出项。"""
+    return [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]}]
+
+
+def model_call(name, call_id, arguments="{}"):
+    """构造一条带调用 ID 的工具请求，让被测 Agent Loop 进入工具执行分支。"""
+    return [{"type": "function_call", "name": name, "call_id": call_id, "arguments": arguments}]
+
+
 class Handler(BaseHTTPRequestHandler):
+    """用同一个本地 HTTP 服务模拟模型和 MCP，具体回复由各测试设置的状态决定。"""
+
     protocol_version = "HTTP/1.1"
 
     def log_message(self, *_):
@@ -44,6 +60,7 @@ class Handler(BaseHTTPRequestHandler):
         self.reply(204)
 
     def do_POST(self):
+        """按路径把请求分派给模型接口或 MCP 接口。"""
         request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         if self.path == "/v1/responses":
             self.model(request)
@@ -53,6 +70,7 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(404)
 
     def model(self, request):
+        """记录并校验 Responses 请求，按用例返回工具调用、最终回复或上游错误。"""
         state = self.server.state
         state["requests"].append(request)
         history = request.get("input")
@@ -67,7 +85,11 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(400)
             return
         if state["fail_model"] or (state.get("fail_after_tool") and history[-1].get("type") == "function_call_output"):
-            self.reply(500)
+            self.reply(state.get("model_error_status", 500))
+            return
+        if "model_output" in state:
+            output = state["model_output"](request)
+            self.reply(200, {"status": "completed", "output": output}, {"Content-Type": "application/json"})
             return
         names = {tool["name"] for tool in tools}
         expected = {"echo", *state["tools"]}
@@ -103,6 +125,7 @@ class Handler(BaseHTTPRequestHandler):
                    {"Content-Type": "application/json"})
 
     def mcp(self, request):
+        """校验认证及 MCP 会话 ID，模拟握手、工具发现和调用后的 JSON 或 SSE 回包。"""
         if self.headers.get("Authorization") != "Bearer test-token" or self.headers.get("X-Test") != "test-header":
             self.server.state["errors"].append("HTTP MCP 请求头错误")
             self.reply(401)
@@ -140,7 +163,11 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(200, response, {"Content-Type": "application/json", "Mcp-Session-Id": "web-test"})
 
 
+# ******************************** 测试环境与请求辅助方法 ********************************
+
 class WebIntegration(unittest.TestCase):
+    """每个用例启动独立的 DogOHarness 子进程、模拟上游及临时 SQLite 数据库。"""
+
     def setUp(self):
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.server.state = {"tools": [], "results": {}, "errors": [], "requests": [], "fail_model": False}
@@ -150,6 +177,7 @@ class WebIntegration(unittest.TestCase):
         self.db_path = Path(self.temp.name) / "history.sqlite3"
         self.env = dict(os.environ, LLM_API_KEY="model-secret", LLM_MODEL="model", DOGO_WEB_PORT="0",
                         DOGO_DB_PATH=str(self.db_path),
+                        DOGO_MAX_MODEL_CONCURRENCY="2", DOGO_MAX_UNFINISHED_TURNS="16",
                         LLM_API_URL=f"http://127.0.0.1:{self.server.server_port}/v1/responses",
                         NO_PROXY="127.0.0.1", no_proxy="127.0.0.1")
         self.process = None
@@ -157,6 +185,7 @@ class WebIntegration(unittest.TestCase):
         self.start_app()
 
     def start_app(self):
+        """启动被测程序，从启动日志读取系统实际分配的本地端口。"""
         self.process = subprocess.Popen([BINARY], cwd=ROOT, env=self.env, stdin=subprocess.DEVNULL,
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         ready, _, _ = select.select([self.process.stdout], [], [], 10)
@@ -187,6 +216,7 @@ class WebIntegration(unittest.TestCase):
         self.temp.cleanup()
 
     def request(self, path, method="GET", body=None, headers=None):
+        """经由网页 HTTP 接口发送请求，保留状态码和响应正文供断言。"""
         headers = dict(headers or {})
         data = None
         if body is not None:
@@ -204,12 +234,33 @@ class WebIntegration(unittest.TestCase):
             return response.status, content
 
     def new_conversation(self):
+        """创建空会话，返回可用于读取历史和提交消息的接口路径。"""
         status, info = self.request("/api/conversations", "POST")
         self.assertEqual(status, 200, info)
         self.assertEqual(info["title"], "新对话")
         return f"/api/conversations/{info['id']}/messages"
 
+    def wait_progress(self, path, matches):
+        """在超时前轮询进度，直到用例指定的队列状态出现。"""
+        until = time.monotonic() + 5
+        while time.monotonic() < until:
+            status, data = self.request(path.removesuffix("messages") + "progress")
+            self.assertEqual(status, 200, data)
+            if matches(data):
+                return data
+            time.sleep(0.02)
+        self.fail(f"会话状态未达到预期: {data}")
+
+    def submit_connection(self, path, text):
+        """发送消息后立刻交还 HTTP 连接，供用例模拟发送方关闭标签页。"""
+        address = urlsplit(self.base)
+        conn = HTTPConnection(address.hostname, address.port, timeout=10)
+        conn.request("POST", path, json.dumps({"message": text}), {"Content-Type": "application/json"})
+        self.addCleanup(conn.close)
+        return conn
+
     def connect_test_tools(self, hints, callback, *, server_parallel=False):
+        """通过真实注册接口公布测试工具，并为远端调用指定回调和并发提示。"""
         state = self.server.state
         state["mcp_tools"] = [{"name": name, "inputSchema": {"type": "object"},
                                **({"annotations": {"readOnlyHint": hint}} if hint is not None else {})}
@@ -224,14 +275,19 @@ class WebIntegration(unittest.TestCase):
         state["tools"] = [f"mcp__remote__{name}" for name in hints]
         state["results"] = {f"mcp__remote__{name}": name for name in hints}
 
+    # ******************************** 工具并发与执行顺序 ********************************
+
     def test_parallel_batch_and_exclusive_tool(self):
+        """相邻只读工具可以重叠执行，独占工具要等前一组完成。"""
         self.check_parallel_batch(server_parallel=False)
 
     def test_server_parallel_override(self):
+        """服务显式允许并发时，缺少只读提示的工具也可以同时执行。"""
         self.server.state["json_tool_results"] = True
         self.check_parallel_batch(server_parallel=True)
 
     def check_parallel_batch(self, server_parallel):
+        """用事件控制两个工具的完成顺序，检查工具执行的先后和模型收到的结果顺序。"""
         slow_started, fast_finished = threading.Event(), threading.Event()
         events = []
 
@@ -261,7 +317,26 @@ class WebIntegration(unittest.TestCase):
             self.assertLess(events.index(("end", "exclusive")), events.index(("start", "after")))
         self.assertEqual(self.server.state["errors"], [])
 
+    def test_invalid_arguments_keep_their_place_in_batch(self):
+        """同批调用两次 echo，一条参数有误时，两条结果仍按各自的调用 ID 回传。"""
+        def model(request):
+            if request["input"][-1].get("role") == "user":
+                return model_call("echo", "bad", "{") + model_call("echo", "good", '{"text":"第二条"}')
+            return model_text()
+
+        self.server.state["model_output"] = model
+        status, response = self.request(self.new_conversation(), "POST", {"message": "调用两次 echo"})
+        self.assertEqual(status, 200, response)
+        history = self.server.state["requests"][-1]["input"]
+        outputs = [item for item in history if item.get("type") == "function_call_output"]
+        self.assertEqual([item["call_id"] for item in outputs], ["bad", "good"])
+        self.assertIn("工具参数不是有效 JSON", json.loads(outputs[0]["output"])["error"])
+        self.assertEqual(outputs[1]["output"], "第二条")
+
+    # ******************************** 会话排队、限流与失败恢复 ********************************
+
     def test_concurrent_conversations_and_ordered_turns(self):
+        """A 的慢工具阻塞同会话的下一条消息，B 会话仍可完成。"""
         entered, release = threading.Event(), threading.Event()
 
         def call(name):
@@ -291,7 +366,181 @@ class WebIntegration(unittest.TestCase):
         self.assertEqual(self.request(b)[1]["messages"][0]["content"], "B1")
         self.assertEqual(self.server.state["errors"], [])
 
+    def test_queue_survives_closed_tabs_and_refuses_overflow(self):
+        """发送方断开后队列仍会处理已受理的消息，全局队列满时新消息得到 503。"""
+        self.stop_app()
+        self.env["DOGO_MAX_UNFINISHED_TURNS"] = "2"
+        self.start_app()
+        entered, release = threading.Event(), threading.Event()
+
+        def model(request):
+            if request["input"][-1]["content"] == "A1":
+                entered.set()
+                self.assertTrue(release.wait(8))
+            return model_text()
+
+        self.server.state["model_output"] = model
+        a, b = self.new_conversation(), self.new_conversation()
+        first = self.submit_connection(a, "A1")
+        try:
+            self.assertTrue(entered.wait(5))
+            second = self.submit_connection(a, "A2")
+            progress = self.wait_progress(a, lambda p: len(p["turns"]) == 2)
+            first.close()
+            second.close()
+            self.assertEqual([(t["message"], t["status"]) for t in progress["turns"]],
+                             [("A1", "running"), ("A2", "queued")])
+            snapshot = self.request(a)[1]
+            self.assertEqual(snapshot["messages"], [])
+            self.assertEqual(snapshot["progress"], progress)
+            status, error = self.request(b, "POST", {"message": "B1"})
+            self.assertEqual(status, 503)
+            self.assertIn("尚未入队", error["error"])
+            self.assertEqual(self.request(b)[1]["progress"]["turns"], [])
+        finally:
+            release.set()
+        self.wait_progress(a, lambda p: not p["turns"])
+        saved = self.request(a)[1]
+        self.assertEqual([m["content"] for m in saved["messages"]], ["A1", "完成", "A2", "完成"])
+        self.assertEqual(saved["conversation"]["title"], "A1")
+        self.assertEqual(self.server.state["requests"][-1]["input"][0]["content"], "A1")
+        self.assertEqual(self.request(b, "POST", {"message": "B1"})[0], 200)
+
+    def test_failure_can_be_recovered_by_multiple_tabs(self):
+        """多个页面均可恢复失败原文和原因，重新发消息后清除旧错误，上游限流返回 429。"""
+        entered, release = threading.Event(), threading.Event()
+        def model(request):
+            if request["input"][-1]["content"] == "失败原文":
+                entered.set()
+                self.assertTrue(release.wait(8))
+                return []
+            return model_text()
+        self.server.state["model_output"] = model
+        path = self.new_conversation()
+        connection = self.submit_connection(path, "失败原文")
+        try:
+            self.assertTrue(entered.wait(5))
+            turn = self.request(path)[1]["progress"]["turns"][0]
+            connection.close()
+        finally:
+            release.set()
+        progress = self.wait_progress(path, lambda p: p["last_failure"] is not None)
+        failure = progress["last_failure"]
+        self.assertEqual((failure["id"], failure["message"]), (turn["id"], "失败原文"))
+        self.assertIn("模型没有返回", failure["error"])
+        for _ in range(2):
+            recovered = self.request(path)[1]
+            self.assertEqual(recovered["messages"], [])
+            self.assertEqual(recovered["progress"], progress)
+        self.assertEqual(self.request(path, "POST", {"message": "重试"})[0], 200)
+        self.assertIsNone(self.request(path)[1]["progress"]["last_failure"])
+        self.server.state.update(fail_model=True, model_error_status=429)
+        status, error = self.request(path, "POST", {"message": "上游限流"})
+        self.assertEqual(status, 429)
+        self.assertIn("模型服务限流", error["error"])
+
+    def test_model_slot_is_released_while_waiting_for_a_tool(self):
+        """只有一个模型名额时，A 等待工具期间，B 已经可以请求模型并完成回复。"""
+        self.stop_app()
+        self.env["DOGO_MAX_MODEL_CONCURRENCY"] = "1"
+        self.start_app()
+        first_model, other_model = threading.Event(), threading.Event()
+        tool_started, release_model, release_tool = threading.Event(), threading.Event(), threading.Event()
+        def model(request):
+            last = request["input"][-1]
+            if last.get("content") == "A":
+                first_model.set()
+                self.assertTrue(release_model.wait(8))
+                return model_call("mcp__remote__slow", "slow1")
+            if last.get("content") == "B":
+                other_model.set()
+            return model_text()
+        def tool(name):
+            tool_started.set()
+            self.assertTrue(release_tool.wait(8))
+            return {"content": [{"type": "text", "text": name}]}
+        self.server.state["model_output"] = model
+        self.connect_test_tools({"slow": True}, tool)
+        a, b = self.new_conversation(), self.new_conversation()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(self.request, a, "POST", {"message": "A"})
+            try:
+                self.assertTrue(first_model.wait(5))
+                other = pool.submit(self.request, b, "POST", {"message": "B"})
+                self.wait_progress(b, lambda p: bool(p["turns"]))
+                self.assertFalse(other_model.wait(0.2))
+                release_model.set()
+                self.assertTrue(tool_started.wait(5))
+                self.assertEqual(other.result(timeout=5)[0], 200)
+                self.assertFalse(first.done())
+            finally:
+                release_model.set()
+                release_tool.set()
+            self.assertEqual(first.result(timeout=5)[0], 200)
+
+    # ******************************** MCP 重连、断线与动态注册 ********************************
+
+    def test_reconnected_server_is_used_only_for_new_model_requests(self):
+        """重连期间产生的旧工具调用留在原连接，下一次模型请求可以看到新工具。"""
+        entered, release = threading.Event(), threading.Event()
+        invoked = []
+        def tool(name):
+            invoked.append(name)
+            return {"content": [{"type": "text", "text": name}]}
+        def model(request):
+            outputs = [m for m in request["input"] if m.get("type") == "function_call_output"]
+            if not outputs:
+                entered.set()
+                self.assertTrue(release.wait(8))
+                return model_call("mcp__remote__read", "old")
+            if len(outputs) == 1:
+                return model_call("mcp__remote__read", "new")
+            return model_text()
+        self.server.state["model_output"] = model
+        self.connect_test_tools({"read": True}, tool)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            turn = pool.submit(self.request, self.new_conversation(), "POST", {"message": "切换连接"})
+            try:
+                self.assertTrue(entered.wait(5))
+                self.assertEqual(self.request("/api/mcp/servers/remote", "DELETE")[0], 200)
+                self.connect_test_tools({"read": True, "added": True}, tool)
+            finally:
+                release.set()
+            self.assertEqual(turn.result(timeout=5)[0], 200)
+        first, second, third = self.server.state["requests"]
+        self.assertNotIn("mcp__remote__added", [t["name"] for t in first["tools"]])
+        self.assertIn("mcp__remote__added", [t["name"] for t in second["tools"]])
+        self.assertIn("未发出", json.loads(second["input"][-1]["output"])["error"])
+        self.assertEqual(third["input"][-1]["output"], "read")
+        self.assertEqual(invoked, ["read"])
+
+    def test_disconnect_after_tool_receives_call_reports_unknown_result(self):
+        """服务收到调用后断开，模型应收到执行结果未知的提示。"""
+        entered, release = threading.Event(), threading.Event()
+        def tool(name):
+            entered.set()
+            self.assertTrue(release.wait(8))
+            return {"content": [{"type": "text", "text": name}]}
+        def model(request):
+            if request["input"][-1].get("role") == "user":
+                return model_call("mcp__remote__write", "write1")
+            return model_text()
+        self.server.state["model_output"] = model
+        self.connect_test_tools({"write": None}, tool)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            turn = pool.submit(self.request, self.new_conversation(), "POST", {"message": "执行工具"})
+            try:
+                self.assertTrue(entered.wait(5))
+                self.assertEqual(self.request("/api/mcp/servers/remote", "DELETE")[0], 200)
+            finally:
+                release.set()
+            self.assertEqual(turn.result(timeout=5)[0], 200)
+        last = self.server.state["requests"][-1]
+        self.assertEqual([t["name"] for t in last["tools"]], ["echo"])
+        self.assertIn("结果未知", json.loads(last["input"][-1]["output"])["error"])
+
     def test_web_chat_and_dynamic_mcp(self):
+        """从网页接口注册 stdio 和 HTTP 服务，在同一回合调用两者，并检查断开与来源校验。"""
         status, html = self.request("/")
         self.assertEqual(status, 200)
         self.assertIn(b'id="chat-form"', html)
@@ -342,8 +591,8 @@ class WebIntegration(unittest.TestCase):
         status, result = self.request(chat, "POST", {"message": "请调用工具"})
         self.assertEqual(status, 200, result)
         self.assertEqual(result["messages"][-1]["content"], "工具执行完成")
-        self.assertEqual(self.request(chat), (200, {"messages": [
-            {"role": "user", "content": "请调用工具"}, {"role": "assistant", "content": "工具执行完成"}]}))
+        self.assertEqual(self.request(chat)[1]["messages"], [
+            {"role": "user", "content": "请调用工具"}, {"role": "assistant", "content": "工具执行完成"}])
         self.assertEqual(self.request(chat, "POST", {"message": "再调用一次"})[0], 200)
         second_turn = state["requests"][-2]["input"]
         self.assertEqual(second_turn[0]["content"], "请调用工具")
@@ -353,7 +602,9 @@ class WebIntegration(unittest.TestCase):
         other = self.new_conversation()
         state["fail_model"] = True
         self.assertEqual(self.request(other, "POST", {"message": "失败的请求"})[0], 502)
-        self.assertEqual(self.request(other), (200, {"messages": []}))
+        failed = self.request(other)[1]
+        self.assertEqual(failed["messages"], [])
+        self.assertEqual(failed["progress"]["last_failure"]["message"], "失败的请求")
         state["fail_model"] = False
 
         self.assertEqual(self.request("/api/mcp/servers/local", "DELETE")[0], 200)
@@ -375,7 +626,10 @@ class WebIntegration(unittest.TestCase):
         self.assertEqual(self.request("/api/mcp/servers", headers={"Host": "evil.example"})[0], 403)
         self.assertEqual(state["errors"], [])
 
+    # ******************************** 会话历史、模型响应与事务 ********************************
+
     def test_conversations_survive_restart(self):
+        """重启后按原顺序回传包含工具调用的完整历史，失败回合不会留下部分消息。"""
         state = self.server.state
         state.update(tools=["echo"], results={"echo": "回声验证"})
         self.assertEqual(self.request("/api/conversations"), (200, {"conversations": []}))
@@ -404,16 +658,17 @@ class WebIntegration(unittest.TestCase):
         self.assertEqual(state["requests"][-2]["input"][:-1], original)
 
         with sqlite3.connect(self.db_path) as db:
-            before = self.request(first)
+            before = self.request(first)[1]["messages"]
             count = db.execute("SELECT count(*) FROM messages").fetchone()[0]
             state["fail_after_tool"] = True
             self.assertEqual(self.request(first, "POST", {"message": "最终回复失败"})[0], 502)
-            self.assertEqual(self.request(first), before)
+            self.assertEqual(self.request(first)[1]["messages"], before)
             self.assertEqual(db.execute("SELECT count(*) FROM messages").fetchone()[0], count)
         self.assertEqual(self.request("/api/conversations/999/messages")[0], 404)
         self.assertEqual(state["errors"], [])
 
     def test_responses_text_refusal_and_incomplete_turn(self):
+        """正文与拒答均可展示，生成中断或失败时已保存的历史保持完整。"""
         state = self.server.state
         chat = self.new_conversation()
         state["model_response"] = {"status": "completed", "output": [
@@ -421,21 +676,22 @@ class WebIntegration(unittest.TestCase):
         self.assertEqual(self.request(chat, "POST", {"message": "打个招呼"})[1]["messages"][-1]["content"], "你好")
         state["model_response"]["output"][0]["content"] = [{"type": "refusal", "refusal": "无法完成这个请求"}]
         self.assertEqual(self.request(chat, "POST", {"message": "继续"})[1]["messages"][-1]["content"], "无法完成这个请求")
-        before = self.request(chat)
+        before = self.request(chat)[1]["messages"]
         state["model_response"] = {"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"},
                                    "output": [{"type": "message", "role": "assistant",
                                                "content": [{"type": "output_text", "text": "部分文字"}]}]}
         status, error = self.request(chat, "POST", {"message": "再问一次"})
         self.assertEqual(status, 502)
         self.assertIn("max_output_tokens", error["error"])
-        self.assertEqual(self.request(chat), before)
+        self.assertEqual(self.request(chat)[1]["messages"], before)
         state["model_response"] = {"status": "failed", "error": {"message": "网关生成失败"}}
         status, error = self.request(chat, "POST", {"message": "重试"})
         self.assertEqual(status, 502)
         self.assertIn("网关生成失败", error["error"])
-        self.assertEqual(self.request(chat), before)
+        self.assertEqual(self.request(chat)[1]["messages"], before)
 
     def test_resume_saved_tool_calls_from_chat_completions(self):
+        """旧库中的工具调用和结果能按 ID 配对还原，续聊时保留原始数据库行。"""
         chat = self.new_conversation()
         conversation_id = int(chat.split("/")[3])
         old_messages = [
@@ -465,6 +721,7 @@ class WebIntegration(unittest.TestCase):
         self.assertEqual([json.loads(payload) for _, payload in rows[:5]], old_messages)
 
     def test_incomplete_database_write_rolls_back(self):
+        """在一轮写入中途触发 SQLite 错误，验证事务整体回滚并可重新发送。"""
         self.server.state.update(tools=["echo"], results={"echo": "回声验证"})
         chat = self.new_conversation()
         with sqlite3.connect(self.db_path) as db:
@@ -477,7 +734,10 @@ class WebIntegration(unittest.TestCase):
         self.assertEqual(self.request(chat, "POST", {"message": "重试"})[0], 200)
         self.assertEqual(self.request("/api/conversations")[1]["conversations"][0]["title"], "重试")
 
+    # ******************************** 独立 HTTP 演示服务 ********************************
+
     def test_http_demo(self):
+        """启动 examples 中的 HTTP 服务，经由完整对话确认模型收到了演示工具的结果。"""
         demo = subprocess.Popen([sys.executable, str(ROOT / "examples/mcp_http_demo.py"), "0"],
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.addCleanup(self.stop_process, demo)

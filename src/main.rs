@@ -7,13 +7,16 @@ mod web;
 
 use config::Config;
 use conversation::ConversationStore;
-use reqwest::Client;
-use std::{error::Error, time::Duration};
-// ***************************************主函数***************************************
+use llm::ModelClient;
+use std::error::Error;
+
+// ******************************** 程序入口 ********************************
+
+/// 读取配置，打开会话数据库，再用共享的模型客户端启动 Web 服务。
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let config = Config::load()?;
     let store = ConversationStore::open(&config.database_path)?;
-    let client = Client::builder().timeout(Duration::from_secs(60)).build()?;
-    web::serve(config, client, store).await
+    let max_turns = config.max_unfinished_turns;
+    web::serve(ModelClient::new(config)?, store, max_turns).await
 }

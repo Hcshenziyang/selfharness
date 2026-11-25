@@ -4,7 +4,10 @@ import json
 import sys
 
 
+# ******************************** MCP 方法与演示工具 ********************************
+
 def handle(method, params):
+    """处理握手、工具发现、工具调用和 ping。找不到方法时由外层返回 JSON-RPC 错误。"""
     if method == "initialize":
         return {
             "protocolVersion": params["protocolVersion"],
@@ -28,6 +31,9 @@ def handle(method, params):
     return None
 
 
+# ******************************** 标准输入与输出 ********************************
+
+# 一行对应一条 JSON-RPC 消息。只有带 id 的请求才需要回包，工具日志单独写入 stderr。
 for line in sys.stdin:
     request = json.loads(line)
     if "id" not in request:

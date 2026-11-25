@@ -1,6 +1,6 @@
-/* ─── Design Tokens: Terra Light (VS Code Inspired) ─── */
+/* ******************************** 浅色主题变量 ******************************** */
 :root {
-  /* Sidebar – Deep warm earth brown */
+  /* 侧栏背景、边框与文字色 */
   --sidebar-bg: #342c24;
   --sidebar-surface: #3d342b;
   --sidebar-hover: #483e34;
@@ -11,7 +11,7 @@
   --sidebar-text-muted: #9c8e7b;
   --sidebar-text-dim: #786c5c;
 
-  /* Main Workspace – Warm cream & parchment */
+  /* 聊天区域背景与边框 */
   --bg-app: #f7f1e7;
   --bg-primary: #faf5ee;
   --bg-secondary: #f2ebe0;
@@ -24,13 +24,13 @@
   --border-subtle: #e9dfcf;
   --border-focus: #b45d6e;
 
-  /* Typography */
+  /* 正文与辅助文字颜色 */
   --text-primary: #2e261f;
   --text-secondary: #66594b;
   --text-muted: #948574;
   --text-dim: #b8ac9c;
 
-  /* Terra Accents */
+  /* 主强调色及交互状态 */
   --accent: #b45d6e;
   --accent-hover: #a14e5f;
   --accent-active: #8f4252;
@@ -38,7 +38,7 @@
   --accent-muted: rgba(180, 93, 110, 0.16);
   --accent-glow: rgba(180, 93, 110, 0.25);
 
-  /* Secondary Accents */
+  /* 辅助强调色、成功与错误状态 */
   --teal-accent: #48828e;
   --teal-hover: #3d717c;
   --gold-accent: #c48037;
@@ -47,14 +47,14 @@
   --danger: #be4343;
   --danger-bg: rgba(190, 67, 67, 0.12);
 
-  /* Message Bubbles */
+  /* 用户与助手的消息气泡 */
   --bubble-user-bg: #48828e;
   --bubble-user-text: #ffffff;
   --bubble-assistant-bg: #f4ecdf;
   --bubble-assistant-border: #e3d7c5;
   --bubble-assistant-text: #2e261f;
 
-  /* Radii & Shadows */
+  /* 圆角与阴影 */
   --radius-xs: 4px;
   --radius-sm: 6px;
   --radius-md: 10px;
@@ -68,23 +68,23 @@
   --shadow-lg: 0 10px 30px rgba(46, 38, 31, 0.12);
   --shadow-composer: 0 4px 24px rgba(46, 38, 31, 0.08), 0 1px 4px rgba(46, 38, 31, 0.04);
 
-  /* Animations */
+  /* 过渡曲线与时长 */
   --ease-spring: cubic-bezier(0.16, 1, 0.3, 1);
   --ease-smooth: cubic-bezier(0.4, 0, 0.2, 1);
   --duration-fast: 0.15s;
   --duration-normal: 0.25s;
 
-  /* Dimensions */
+  /* 导航、标题和正文区域的尺寸 */
   --sidebar-width: 290px;
   --header-height: 54px;
   --max-content-width: 780px;
 
-  /* Font stacks */
+  /* 正文与等宽字体 */
   --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
   --font-mono: "SF Mono", "JetBrains Mono", Consolas, Menlo, Monaco, monospace;
 }
 
-/* ─── Global Reset & Base ─── */
+/* ******************************** 全局基础样式 ******************************** */
 *, *::before, *::after {
   box-sizing: border-box;
 }
@@ -134,7 +134,7 @@ h1, h2, h3, h4, p, ul, ol {
   outline-offset: 2px;
 }
 
-/* ─── App Shell Layout ─── */
+/* ******************************** 页面整体布局 ******************************** */
 .app-shell {
   display: flex;
   height: 100vh;
@@ -144,7 +144,7 @@ h1, h2, h3, h4, p, ul, ol {
   background: var(--bg-app);
 }
 
-/* ─── Sidebar ─── */
+/* ******************************** 侧栏与会话导航 ******************************** */
 .sidebar {
   width: var(--sidebar-width);
   flex-shrink: 0;
@@ -198,7 +198,7 @@ h1, h2, h3, h4, p, ul, ol {
   font-weight: 400;
 }
 
-/* Sidebar Body / Section */
+/* 侧栏的可滚动内容区 */
 .sidebar-section {
   flex: 1;
   overflow-y: auto;
@@ -229,7 +229,7 @@ h1, h2, h3, h4, p, ul, ol {
   margin-bottom: 8px;
 }
 
-/* Action button to open form */
+/* 历史会话与添加服务共用的侧栏按钮 */
 .sidebar-action {
   display: flex;
   align-items: center;
@@ -287,7 +287,7 @@ h1, h2, h3, h4, p, ul, ol {
   color: #e28587;
 }
 
-/* ─── Form Collapse / Expand Grid Technique ─── */
+/* ******************************** MCP 连接表单 ******************************** */
 .form-reveal {
   display: grid;
   grid-template-rows: 0fr;
@@ -312,7 +312,7 @@ h1, h2, h3, h4, p, ul, ol {
   transform: translateY(0);
 }
 
-/* Server Form */
+/* 服务连接字段 */
 .server-form {
   padding: 12px;
   margin: 8px 0;
@@ -412,7 +412,7 @@ h1, h2, h3, h4, p, ul, ol {
   pointer-events: none;
 }
 
-/* Sidebar Footer */
+/* 侧栏底部的本地运行状态 */
 .sidebar-footer {
   padding: 12px 16px;
   border-top: 1px solid var(--sidebar-border-subtle);
@@ -452,7 +452,7 @@ h1, h2, h3, h4, p, ul, ol {
   100% { opacity: 0; transform: scale(2); }
 }
 
-/* ─── Server Cards ─── */
+/* ******************************** MCP 服务卡片与工具清单 ******************************** */
 .servers {
   display: flex;
   flex-direction: column;
@@ -601,7 +601,7 @@ h1, h2, h3, h4, p, ul, ol {
   background: rgba(255, 125, 125, 0.12);
 }
 
-/* ─── Main Chat Workspace ─── */
+/* ******************************** 聊天区域与滚动 ******************************** */
 .chat-area {
   flex: 1;
   display: flex;
@@ -612,7 +612,7 @@ h1, h2, h3, h4, p, ul, ol {
   position: relative;
 }
 
-/* Chat Header */
+/* 会话标题与新建按钮 */
 .chat-header {
   height: var(--header-height);
   flex-shrink: 0;
@@ -648,7 +648,7 @@ h1, h2, h3, h4, p, ul, ol {
   flex-shrink: 0;
 }
 
-/* Scroll Area & FAB Wrap */
+/* 消息滚动区域与悬浮按钮容器 */
 .chat-scroll-wrap {
   flex: 1;
   position: relative;
@@ -679,7 +679,7 @@ h1, h2, h3, h4, p, ul, ol {
   background: var(--text-muted);
 }
 
-/* Scroll To Bottom FAB Button */
+/* 回到底部按钮 */
 .scroll-fab {
   position: absolute;
   right: 28px;
@@ -718,7 +718,7 @@ h1, h2, h3, h4, p, ul, ol {
   transform: translateY(0) scale(0.95);
 }
 
-/* ─── Empty State ─── */
+/* ******************************** 空会话欢迎页 ******************************** */
 .empty-chat {
   min-height: 100%;
   display: flex;
@@ -769,7 +769,7 @@ h1, h2, h3, h4, p, ul, ol {
   font-size: 0.88rem;
 }
 
-/* ─── Message Flow ─── */
+/* ******************************** 消息列表与气泡 ******************************** */
 .messages {
   max-width: var(--max-content-width);
   width: 100%;
@@ -797,7 +797,7 @@ h1, h2, h3, h4, p, ul, ol {
   flex-direction: row-reverse;
 }
 
-/* Avatars */
+/* 用户与助手头像 */
 .avatar {
   flex-shrink: 0;
   width: 30px;
@@ -821,7 +821,7 @@ h1, h2, h3, h4, p, ul, ol {
   color: #fff;
 }
 
-/* Message Content Wrap */
+/* 气泡及其操作按钮的布局 */
 .bubble-wrap {
   display: flex;
   flex-direction: column;
@@ -833,7 +833,7 @@ h1, h2, h3, h4, p, ul, ol {
   align-items: flex-end;
 }
 
-/* Bubbles */
+/* 按发送方区分气泡样式 */
 .bubble {
   padding: 10px 15px;
   line-height: 1.65;
@@ -856,7 +856,7 @@ h1, h2, h3, h4, p, ul, ol {
   color: var(--bubble-user-text);
 }
 
-/* Markdown styling inside assistant bubble */
+/* 助手回复中的段落、行内代码与代码块 */
 .bubble p {
   margin: 0;
 }
@@ -897,7 +897,7 @@ h1, h2, h3, h4, p, ul, ol {
   color: inherit;
 }
 
-/* Message Action Bar (Copy Button on Hover) */
+/* 悬停在助手消息上时显示复制按钮 */
 .message-actions {
   display: flex;
   align-items: center;
@@ -932,7 +932,7 @@ h1, h2, h3, h4, p, ul, ol {
   flex-shrink: 0;
 }
 
-/* Thinking Indicator */
+/* 等待回复时的圆点动画 */
 .message.pending .bubble {
   display: flex;
   align-items: center;
@@ -970,7 +970,7 @@ h1, h2, h3, h4, p, ul, ol {
   }
 }
 
-/* ─── Composer Area ─── */
+/* ******************************** 聊天输入区 ******************************** */
 .composer-area {
   flex-shrink: 0;
   max-width: var(--max-content-width);
@@ -981,7 +981,7 @@ h1, h2, h3, h4, p, ul, ol {
   z-index: 10;
 }
 
-/* Error Banner */
+/* 聊天错误提示 */
 .error-banner {
   display: flex;
   align-items: center;
@@ -1019,7 +1019,7 @@ h1, h2, h3, h4, p, ul, ol {
   opacity: 1;
 }
 
-/* Composer Box */
+/* 消息输入框 */
 .composer {
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
@@ -1084,7 +1084,7 @@ h1, h2, h3, h4, p, ul, ol {
   box-shadow: 0 1px 0 rgba(0, 0, 0, 0.06);
 }
 
-/* Send Button */
+/* 发送按钮 */
 .btn-send {
   width: 32px;
   height: 32px;
@@ -1123,7 +1123,7 @@ h1, h2, h3, h4, p, ul, ol {
   transform: translateX(1px);
 }
 
-/* ─── Buttons ─── */
+/* ******************************** 通用按钮 ******************************** */
 .btn {
   display: inline-flex;
   align-items: center;
@@ -1186,7 +1186,7 @@ h1, h2, h3, h4, p, ul, ol {
   color: var(--sidebar-text);
 }
 
-/* ─── Feedback & Errors ─── */
+/* ******************************** 表单反馈 ******************************** */
 .feedback {
   margin: 6px 0;
   line-height: 1.4;
@@ -1197,7 +1197,7 @@ h1, h2, h3, h4, p, ul, ol {
   color: #ff8888;
 }
 
-/* ─── Utilities ─── */
+/* ******************************** 辅助样式 ******************************** */
 .visually-hidden {
   position: absolute;
   width: 1px;
@@ -1214,7 +1214,7 @@ h1, h2, h3, h4, p, ul, ol {
   display: none;
 }
 
-/* ─── Mobile Sidebar Overlay ─── */
+/* ******************************** 移动端侧栏遮罩 ******************************** */
 .sidebar-overlay {
   position: fixed;
   inset: 0;
@@ -1225,7 +1225,7 @@ h1, h2, h3, h4, p, ul, ol {
   transition: opacity 0.25s var(--ease-smooth);
 }
 
-/* ─── Responsive Media Queries ─── */
+/* ******************************** 窄屏布局 ******************************** */
 @media (max-width: 768px) {
   .sidebar {
     position: fixed;

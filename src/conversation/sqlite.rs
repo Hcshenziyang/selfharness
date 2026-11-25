@@ -3,11 +3,15 @@ use rusqlite::{Connection, Result, Row, params};
 use serde_json::json;
 use std::path::Path;
 
+// ******************************** 会话库与会话列表 ********************************
+
+/// 持有 SQLite 连接，管理会话元信息和按顺序存储的消息记录。
 pub(crate) struct ConversationStore {
     db: Connection,
 }
 
 impl ConversationStore {
+    /// 打开本地数据库并初始化会话表、消息表及其外键约束。
     pub(crate) fn open(path: &Path) -> Result<Self> {
         let db = Connection::open(path)?;
         db.execute_batch(
@@ -32,6 +36,7 @@ impl ConversationStore {
         Ok(Self { db })
     }
 
+    /// 创建一个空会话，返回网页后续发送消息时使用的 ID 和初始标题。
     pub(crate) fn create(&self) -> Result<ConversationInfo> {
         self.db.query_row(
             "INSERT INTO conversations DEFAULT VALUES RETURNING id, title",
@@ -40,6 +45,7 @@ impl ConversationStore {
         )
     }
 
+    /// 按最近更新时间列出会话，时间相同时将 ID 较大的排在前面。
     pub(crate) fn list(&self) -> Result<Vec<ConversationInfo>> {
         self.db
             .prepare("SELECT id, title FROM conversations ORDER BY updated_at DESC, id DESC")?
@@ -47,11 +53,20 @@ impl ConversationStore {
             .collect()
     }
 
+    /// 按 ID 查会话标题，找不到时返回数据库查询错误。
+    pub(crate) fn info(&self, id: i64) -> Result<ConversationInfo> {
+        self.db.query_row(
+            "SELECT id, title FROM conversations WHERE id = ?1",
+            [id],
+            conversation_info,
+        )
+    }
+
+    // ******************************** 读取历史与保存回合 ********************************
+
+    /// 按数据库中的位置还原完整历史，同时记下下一次增量写入的起点。
     pub(crate) fn load(&self, id: i64) -> Result<Conversation> {
-        self.db
-            .query_row("SELECT id FROM conversations WHERE id = ?1", [id], |_| {
-                Ok(())
-            })?;
+        let info = self.info(id)?;
         let mut statement = self.db.prepare(
             "SELECT position, payload FROM messages WHERE conversation_id = ?1 ORDER BY position",
         )?;
@@ -66,14 +81,14 @@ impl ConversationStore {
             next_position = position + 1;
         }
         Ok(Conversation {
-            id,
+            info,
             saved_len: messages.len(),
             messages,
             next_position,
         })
     }
 
-    /// 把已完成的一轮和会话标题一起提交，模型请求和工具执行期间不占写锁。
+    /// 在一个事务中追加本回合的新记录、更新会话时间，并用首条提问的前 40 个字符命名新会话。
     pub(crate) fn save_turn(&mut self, conversation: &Conversation) -> Result<ConversationInfo> {
         let transaction = self.db.transaction()?;
         {
@@ -85,7 +100,7 @@ impl ConversationStore {
                 .enumerate()
             {
                 insert.execute(params![
-                    conversation.id,
+                    conversation.info.id,
                     conversation.next_position + offset as i64,
                     message
                 ])?;
@@ -103,13 +118,15 @@ impl ConversationStore {
             "UPDATE conversations SET title = coalesce(substr(?1, 1, 40), title),
                 updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now')
              WHERE id = ?2 RETURNING id, title",
-            params![first_question, conversation.id],
+            params![first_question, conversation.info.id],
             conversation_info,
         )?;
         transaction.commit()?;
         Ok(info)
     }
 }
+
+// ******************************** 数据库记录转换 ********************************
 
 /// 把已有会话中的 Chat Completions 记录读成 Responses 输入项。原始数据库行保留。
 fn restore_item(item: Message, messages: &mut Vec<Message>) {
@@ -140,6 +157,7 @@ fn restore_item(item: Message, messages: &mut Vec<Message>) {
     }
 }
 
+/// 将查询结果中的 id、title 两列读为会话摘要。
 fn conversation_info(row: &Row<'_>) -> Result<ConversationInfo> {
     Ok(ConversationInfo {
         id: row.get(0)?,

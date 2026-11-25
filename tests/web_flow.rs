@@ -1,6 +1,6 @@
 use std::process::Command;
 
-// 验证网页接口与真实 MCP 连接、Agent Loop 的完整链路。
+/// 把 Cargo 构建的服务程序交给 Python 测试，覆盖从网页 API、Agent Loop 到 MCP 的完整链路。
 #[test]
 fn web_chat_and_dynamic_mcp() {
     let result = Command::new("python3")

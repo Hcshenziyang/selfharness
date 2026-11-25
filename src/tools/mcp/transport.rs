@@ -13,6 +13,9 @@ use rmcp::{
 use std::{collections::HashMap, env, error::Error};
 use tokio::process::Command;
 
+// ******************************** 建立 MCP 连接 ********************************
+
+/// 按配置启动 stdio 子进程或连接 HTTP 服务，完成 MCP 握手并返回运行中的连接。
 pub(super) async fn connect(
     config: TransportConfig,
 ) -> Result<RunningService<RoleClient, ()>, Box<dyn Error + Send + Sync>> {
@@ -27,7 +30,7 @@ pub(super) async fn connect(
                 return Err("stdio 服务缺少启动命令".into());
             }
             let mut child = Command::new(command);
-            // 不自动把模型 API Key 传给子进程；服务需要的环境变量显式配置。
+            // 子进程只继承下面三个基础变量，服务凭据通过 extra_env 显式传入。
             child.args(args).env_clear().kill_on_drop(true);
             for key in ["PATH", "HOME", "TMPDIR"] {
                 if let Some(value) = env::var_os(key) {
@@ -60,6 +63,7 @@ pub(super) async fn connect(
     }
 }
 
+/// 校验自定义 HTTP 请求头，按大小写无关的名称检查重复，并把值标记为敏感信息。
 fn add_header(
     headers: &mut HashMap<HeaderName, HeaderValue>,
     name: &str,

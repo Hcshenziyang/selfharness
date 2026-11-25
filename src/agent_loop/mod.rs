@@ -1,15 +1,14 @@
 use crate::{
-    config::Config,
     conversation::{Conversation, assistant_text},
-    llm::ask_llm,
+    llm::ModelClient,
     tools,
 };
-use futures_util::future::join_all;
-use reqwest::Client;
 use serde::Deserialize;
-use serde_json::json;
 use std::{collections::HashSet, error::Error};
 
+// ******************************** 工具调用请求 ********************************
+
+/// 模型返回的一条工具调用。`arguments` 是 JSON 字符串，`call_id` 用来匹配执行结果。
 #[derive(Deserialize)]
 struct ToolCall {
     call_id: String,
@@ -18,27 +17,25 @@ struct ToolCall {
     status: Option<String>,
 }
 
-impl ToolCall {
-    async fn execute(&self, mcp: &tools::McpTools) -> String {
-        let result = match serde_json::from_str(&self.arguments) {
-            Ok(arguments) => tools::call(&self.name, &arguments, mcp).await,
-            Err(error) => Err(format!("工具参数不是有效 JSON：{error}")),
-        };
-        result.unwrap_or_else(|error| json!({ "error": error }).to_string())
-    }
-}
+// ******************************** 单次用户回合 ********************************
 
+/// 从一条用户输入开始，反复请求模型并执行工具，直到模型给出最终回复。
+/// 返回的会话包含本回合的全部记录，由调用方保存。
 pub(crate) async fn run_turn(
-    client: &Client,
-    config: &Config,
+    client: &ModelClient,
     mut conversation: Conversation,
     user_input: &str,
-    mcp: &tools::McpTools,
+    mcp: &tools::McpClient,
 ) -> Result<Conversation, Box<dyn Error>> {
     conversation.add_user(user_input);
-    let tool_definitions = tools::definitions(mcp);
     loop {
-        let output = ask_llm(client, config, conversation.messages(), &tool_definitions).await?;
+        // 拿到模型名额后才取工具快照。这次响应里的工具调用都使用这批连接，下一次请求再取。
+        let request = client.request().await?;
+        let snapshot = mcp.tools().await;
+        let output = request
+            .ask_llm(conversation.messages(), &tools::definitions(&snapshot))
+            .await?;
+        // ask_llm 返回时已释放名额，后续等待工具期间其他会话也能请求模型。
         let calls = output
             .iter()
             .filter(|item| item["type"] == "function_call")
@@ -48,8 +45,9 @@ pub(crate) async fn run_turn(
             return Err("模型没有返回正文或工具调用".into());
         }
 
-        // 先检查整批调用，保证每个工具结果都有对应的调用 ID。
+        // 整批校验通过才交给工具层。调用 ID 留在这里，用来匹配写入会话的结果。
         let mut ids = HashSet::new();
+        let mut requests = Vec::with_capacity(calls.len());
         for call in &calls {
             if call.call_id.trim().is_empty()
                 || call.name.trim().is_empty()
@@ -61,20 +59,19 @@ pub(crate) async fn run_turn(
             {
                 return Err("模型返回了无效的工具调用".into());
             }
+            requests.push(tools::ToolRequest {
+                name: &call.name,
+                arguments: &call.arguments,
+            });
         }
 
         conversation.add_output(output);
         if calls.is_empty() {
             return Ok(conversation);
         }
-        // 相邻的可并发调用一起跑。每个独占调用单独成组，等前一组结束才开始。
-        for group in calls.chunk_by(|left, right| {
-            tools::supports_parallel(&left.name, mcp) && tools::supports_parallel(&right.name, mcp)
-        }) {
-            let results = join_all(group.iter().map(|call| call.execute(mcp))).await;
-            for (call, content) in group.iter().zip(results) {
-                conversation.add_tool_result(&call.call_id, content);
-            }
+        let results = tools::call_batch(&requests, &snapshot).await;
+        for (call, content) in calls.iter().zip(results) {
+            conversation.add_tool_result(&call.call_id, content);
         }
     }
 }
