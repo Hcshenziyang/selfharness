@@ -1,5 +1,6 @@
 // ******************************** 通用页面操作 ********************************
 
+export const changes = new BroadcastChannel("dogo-conversations");
 export const byId = id => document.getElementById(id);
 
 export function element(tag, className, text) {
@@ -64,7 +65,7 @@ sidebar.addEventListener("keydown", event => {
     event.preventDefault();
     setSidebar(false);
   } else if (event.key === "Tab") {
-    const buttons = [...sidebar.querySelectorAll("button:enabled")].filter(btn => btn.getClientRects().length);
+    const buttons = [...sidebar.querySelectorAll("button:enabled, select:enabled, input:enabled, summary")].filter(btn => btn.getClientRects().length);
     const first = buttons[0];
     const last = buttons.at(-1);
     if (event.shiftKey && document.activeElement === first || !event.shiftKey && document.activeElement === last) {

@@ -13,12 +13,14 @@ pub(crate) type Message = serde_json::Value;
 #[derive(Serialize)]
 pub(crate) struct ConversationInfo {
     id: i64,
+    pub(crate) agent_id: i64,
     title: String,
 }
 
 /// 一次载入到内存的会话。[`Self::messages`] 供模型续聊，[`Self::visible_messages`] 供网页展示。
 pub(crate) struct Conversation {
     pub(crate) info: ConversationInfo,
+    pub(crate) agent: crate::agent::AgentSettings,
     messages: Vec<Message>,
     /// 载入时的内存记录数，保存时从这里开始取新增记录。
     saved_len: usize,

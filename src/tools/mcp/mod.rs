@@ -1,22 +1,42 @@
+mod calls;
 mod config;
 mod transport;
 
+use crate::conversation::ConversationStore;
+pub(super) use calls::McpTools;
 pub(crate) use config::ServerConfig;
 use rmcp::{
     RoleClient,
-    model::{CallToolRequest, CallToolRequestParams, ServerResult},
-    service::{Peer, PeerRequestOptions, RunningService, ServiceError},
+    service::{Peer, RunningService},
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, error::Error, sync::Arc, time::Duration};
 use tokio::{
     sync::{Mutex, RwLock},
-    time::timeout,
+    task::block_in_place,
+    time::{Instant, timeout_at},
 };
 
-// ******************************** 已连接的服务与工具 ********************************
+pub(crate) type McpError = Box<dyn Error + Send + Sync>;
+pub(crate) type Catalog = BTreeMap<String, ToolGrant>;
 
-/// 一项 MCP 工具，保存模型看到的定义，以及向原服务发起调用所需的连接和原名。
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ToolGrant {
+    original: String,
+    enabled: bool,
+    discovered: bool,
+}
+
+/// 持久化记录只含服务和工具的标识及授权。连接参数随活动连接一起释放。
+pub(crate) struct Binding {
+    pub(crate) id: i64,
+    pub(crate) name: String,
+    pub(crate) transport: String,
+    pub(crate) revision: i64,
+    pub(crate) catalog: Catalog,
+}
+
 struct McpTool {
     peer: Peer<RoleClient>,
     original_name: String,
@@ -24,86 +44,55 @@ struct McpTool {
     supports_parallel: bool,
 }
 
-/// 一个已注册的服务及其公布的工具，持有连接直到服务断开。
 struct McpServer {
     service: RunningService<RoleClient, ()>,
-    // 仅驻留在服务端内存，供重连使用。
     config: ServerConfig,
-    transport: &'static str,
     tools: BTreeMap<String, Arc<McpTool>>,
 }
 
 impl McpServer {
-    /// 同时检查 MCP 会话和底层传输，任一关闭都视为已断开。
     fn connected(&self) -> bool {
         !self.service.is_closed() && !self.service.peer().is_transport_closed()
     }
-}
 
-// ******************************** 服务注册与连接管理 ********************************
+    async fn close(mut self) {
+        let _ = self
+            .service
+            .close_with_timeout(Duration::from_secs(2))
+            .await;
+    }
 
-/// 所有会话共享的 MCP 客户端，负责连接、断开服务和生成可用工具快照。
-#[derive(Default)]
-pub(crate) struct McpClient {
-    servers: RwLock<BTreeMap<String, McpServer>>,
-    // 连接与断开按顺序完成，避免重复启动同名子进程。
-    connection_changes: Mutex<()>, // mutex 互斥锁，同一时间只允许一个连接或断开操作
-}
-
-impl McpClient {
-    /// 连接服务并获取完整工具清单。所有工具名校验通过后，才将整批工具发布给模型。
-    pub(crate) async fn add_server(
-        &self,
-        name: String,
-        config: ServerConfig,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        config::validate_name(&name)?;
-        let _change = self.connection_changes.lock().await;
-        if self.servers.read().await.contains_key(&name) {
-            return Err(format!("MCP 服务 {name} 已存在").into());
+    async fn connect(name: &str, config: ServerConfig) -> Result<Self, McpError> {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let timed_out = |_| format!("MCP 服务 {name} 握手或获取工具清单超时");
+        let service = timeout_at(deadline, transport::connect(config.transport.clone()))
+            .await
+            .map_err(timed_out)?
+            .map_err(|e| format!("MCP 服务 {name} 连接失败：{e}"))?;
+        let mut server = Self {
+            service,
+            config,
+            tools: BTreeMap::new(),
+        };
+        let discovery = match timeout_at(deadline, server.discover(name)).await {
+            Ok(result) => result,
+            Err(elapsed) => Err(timed_out(elapsed).into()),
+        };
+        if let Err(error) = discovery {
+            server.close().await;
+            return Err(error);
         }
-        self.connect_server(name, config).await
+        Ok(server)
     }
 
-    /// 替换现有服务。没有新配置时，用已有配置重新握手。
-    pub(crate) async fn replace_server(
-        &self,
-        name: String,
-        replacement: Option<ServerConfig>,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let _change = self.connection_changes.lock().await;
-        let config = {
-            let servers = self.servers.read().await;
-            let current = servers.get(&name).ok_or("MCP 服务不存在")?;
-            replacement.unwrap_or_else(|| current.config.clone())
-        };
-        self.connect_server(name, config).await
-    }
-
-    /// 在注册表之外完成握手，验证工具名后一次替换连接。失败时仍保留原服务。
-    async fn connect_server(
-        &self,
-        name: String,
-        config: ServerConfig,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let transport_name = match &config.transport {
-            config::TransportConfig::Stdio { .. } => "stdio",
-            config::TransportConfig::Http { .. } => "http",
-        };
-        let (service, remote_tools) = timeout(Duration::from_secs(15), async {
-            let service = transport::connect(config.transport.clone()).await?;
-            let tools = service.list_all_tools().await?;
-            Ok::<_, Box<dyn Error + Send + Sync>>((service, tools))
-        })
-        .await
-        .map_err(|_| format!("MCP 服务 {name} 握手或获取工具清单超时"))?
-        .map_err(|error| format!("MCP 服务 {name} 连接失败：{error}"))?;
-
-        let mut servers = self.servers.write().await;
-        let mut new_tools = BTreeMap::new();
+    async fn discover(&mut self, name: &str) -> Result<(), McpError> {
+        let remote_tools = self
+            .service
+            .list_all_tools()
+            .await
+            .map_err(|e| format!("MCP 服务 {name} 获取工具清单失败：{e}"))?;
         for tool in remote_tools {
             let original_name = tool.name.into_owned();
-            // 对模型使用带服务前缀的名称，同名工具可以来自不同服务。发给 MCP 时还原原名。
             let suffix: String = original_name
                 .chars()
                 .map(|ch| {
@@ -114,183 +103,316 @@ impl McpClient {
                     }
                 })
                 .collect();
-            let tool_name = format!("mcp__{name}__{suffix}");
-            if suffix.is_empty()
-                || tool_name.len() > 64
-                || servers
-                    .iter()
-                    .any(|(other, server)| other != &name && server.tools.contains_key(&tool_name))
-                || new_tools.contains_key(&tool_name)
-            {
-                return Err(format!("MCP 工具无法使用名称 {tool_name}").into());
+            let public = format!("mcp__{name}__{suffix}");
+            if suffix.is_empty() || public.len() > 64 || self.tools.contains_key(&public) {
+                return Err(format!("MCP 工具无法使用名称 {public}").into());
             }
             let definition = super::function_definition(
-                &tool_name,
+                &public,
                 tool.description.as_deref().unwrap_or_default(),
                 tool.input_schema.as_ref(),
             );
-            new_tools.insert(
-                tool_name,
+            self.tools.insert(
+                public,
                 Arc::new(McpTool {
-                    peer: service.peer().clone(),
+                    peer: self.service.peer().clone(),
                     original_name,
                     definition,
-                    supports_parallel: config.supports_parallel_tool_calls
+                    supports_parallel: self.config.supports_parallel_tool_calls
                         || tool
                             .annotations
-                            .is_some_and(|hints| hints.read_only_hint == Some(true)),
+                            .is_some_and(|h| h.read_only_hint == Some(true)),
                 }),
             );
         }
-        let previous = servers.insert(
-            name,
-            McpServer {
-                service,
-                config,
-                transport: transport_name,
-                tools: new_tools,
-            },
-        );
-        drop(servers);
-        if let Some(mut previous) = previous {
-            let _ = previous
-                .service
-                .close_with_timeout(Duration::from_secs(2))
-                .await;
-        }
         Ok(())
     }
+}
 
-    /// 列出供网页展示的服务名称、传输方式、实时连接状态和工具名。
-    pub(crate) async fn servers(&self) -> Vec<Value> {
-        self.servers
+struct Slot {
+    binding: Binding,
+    live: Option<McpServer>,
+}
+
+pub(crate) struct McpClient {
+    agent_id: i64,
+    store: ConversationStore,
+    slots: RwLock<BTreeMap<i64, Slot>>,
+    changes: Mutex<()>,
+}
+
+fn missing() -> McpError {
+    rusqlite::Error::QueryReturnedNoRows.into()
+}
+
+impl McpClient {
+    pub(super) fn load(agent_id: i64, store: ConversationStore) -> rusqlite::Result<Self> {
+        store.tool_policy(agent_id)?;
+        let slots = store
+            .bindings(agent_id)?
+            .into_iter()
+            .map(|binding| {
+                (
+                    binding.id,
+                    Slot {
+                        binding,
+                        live: None,
+                    },
+                )
+            })
+            .collect();
+        Ok(Self {
+            agent_id,
+            store,
+            slots: RwLock::new(slots),
+            changes: Mutex::new(()),
+        })
+    }
+
+    pub(crate) async fn add_server(
+        &self,
+        name: String,
+        config: ServerConfig,
+    ) -> Result<(), McpError> {
+        config::validate_name(&name)?;
+        let _change = self.changes.lock().await;
+        if self
+            .slots
             .read()
             .await
-            .iter()
-            .map(|(name, server)| {
-                json!({ "name": name, "type": server.transport, "connected": server.connected(),
-                    "tools": server.tools.keys().collect::<Vec<_>>() })
-            })
-            .collect()
+            .values()
+            .any(|s| s.binding.name == name)
+        {
+            return Err(format!("MCP 服务 {name} 已存在").into());
+        }
+        self.connect(None, name, config).await
     }
 
-    /// 先从注册表移除服务，再尝试关闭原连接。此后取得的工具快照会排除该服务。
-    pub(crate) async fn remove_server(&self, name: &str) -> Result<(), &'static str> {
-        let _change = self.connection_changes.lock().await;
-        let mut server = self
-            .servers
+    pub(crate) async fn replace_server(
+        &self,
+        id: i64,
+        replacement: Option<ServerConfig>,
+    ) -> Result<(), McpError> {
+        let _change = self.changes.lock().await;
+        let (name, config) = {
+            let slots = self.slots.read().await;
+            let slot = slots.get(&id).ok_or_else(missing)?;
+            let config = replacement
+                .or_else(|| slot.live.as_ref().map(|live| live.config.clone()))
+                .ok_or("请重新填写连接配置及所需凭据")?;
+            (slot.binding.name.clone(), config)
+        };
+        self.connect(Some(id), name, config).await
+    }
+
+    /// 握手时仍可使用旧连接。持久化与发布在同一写锁内完成，再关闭已替换的连接。
+    async fn connect(
+        &self,
+        id: Option<i64>,
+        name: String,
+        config: ServerConfig,
+    ) -> Result<(), McpError> {
+        let live = McpServer::connect(&name, config).await?;
+        let (retired, result) = {
+            let mut slots = self.slots.write().await;
+            match block_in_place(|| self.save_discovery(&slots, id, name, &live)) {
+                Ok(binding) => {
+                    let previous = slots.insert(
+                        binding.id,
+                        Slot {
+                            binding,
+                            live: Some(live),
+                        },
+                    );
+                    (previous.and_then(|slot| slot.live), Ok(()))
+                }
+                Err(error) => (Some(live), Err(error)),
+            }
+        };
+        if let Some(server) = retired {
+            server.close().await;
+        }
+        result
+    }
+
+    fn save_discovery(
+        &self,
+        slots: &BTreeMap<i64, Slot>,
+        id: Option<i64>,
+        name: String,
+        live: &McpServer,
+    ) -> Result<Binding, McpError> {
+        let old = id.and_then(|id| slots.get(&id));
+        let mut catalog = Catalog::new();
+        for (public, tool) in &live.tools {
+            if slots.values().any(|slot| {
+                Some(slot.binding.id) != id && slot.binding.catalog.contains_key(public)
+            }) {
+                return Err(format!("MCP 工具无法使用名称 {public}").into());
+            }
+            let enabled = old
+                .and_then(|slot| slot.binding.catalog.get(public))
+                .is_some_and(|grant| grant.enabled && grant.original == tool.original_name);
+            catalog.insert(
+                public.clone(),
+                ToolGrant {
+                    original: tool.original_name.clone(),
+                    enabled,
+                    discovered: true,
+                },
+            );
+        }
+        // 暂时撤下的工具仍可撤销授权，以原名重新出现前无法调用。
+        if let Some(old) = old {
+            for (public, grant) in &old.binding.catalog {
+                if grant.enabled && !catalog.contains_key(public) {
+                    catalog.insert(
+                        public.clone(),
+                        ToolGrant {
+                            discovered: false,
+                            ..grant.clone()
+                        },
+                    );
+                }
+            }
+        }
+        let transport = match &live.config.transport {
+            config::TransportConfig::Stdio { .. } => "stdio",
+            config::TransportConfig::Http { .. } => "http",
+        };
+        let (id, revision) =
+            self.store
+                .save_binding(self.agent_id, id, &name, transport, &catalog)?;
+        Ok(Binding {
+            id,
+            name,
+            transport: transport.into(),
+            revision,
+            catalog,
+        })
+    }
+
+    pub(crate) async fn servers(&self) -> Vec<Value> {
+        self.slots.read().await.values().map(|slot| {
+            let binding = &slot.binding;
+            let mut tools = Vec::new();
+            let mut enabled = Vec::new();
+            let mut unavailable = Vec::new();
+            for (name, grant) in &binding.catalog {
+                if grant.discovered {
+                    tools.push(name);
+                    if grant.enabled { enabled.push(name); }
+                } else {
+                    unavailable.push(name);
+                }
+            }
+            json!({ "id": binding.id, "name": binding.name, "type": binding.transport, "revision": binding.revision,
+                "connected": slot.live.as_ref().is_some_and(McpServer::connected),
+                "can_reconnect": slot.live.is_some(), "tools": tools, "enabled_tools": enabled, "unavailable_tools": unavailable })
+        }).collect()
+    }
+
+    pub(crate) async fn set_grants(
+        &self,
+        id: i64,
+        revision: i64,
+        changes: BTreeMap<String, bool>,
+    ) -> Result<bool, McpError> {
+        let mut slots = self.slots.write().await;
+        let binding = &mut slots.get_mut(&id).ok_or_else(missing)?.binding;
+        if binding.revision != revision {
+            return Ok(false);
+        }
+        if changes.is_empty() {
+            return Ok(true);
+        }
+        let mut catalog = binding.catalog.clone();
+        for (name, enabled) in changes {
+            catalog
+                .get_mut(&name)
+                .ok_or_else(|| format!("服务没有工具 {name}"))?
+                .enabled = enabled;
+        }
+        catalog.retain(|_, grant| grant.discovered || grant.enabled);
+        if catalog == binding.catalog {
+            return Ok(true);
+        }
+        let (_, revision) = block_in_place(|| {
+            self.store.save_binding(
+                self.agent_id,
+                Some(id),
+                &binding.name,
+                &binding.transport,
+                &catalog,
+            )
+        })?;
+        binding.catalog = catalog;
+        binding.revision = revision;
+        Ok(true)
+    }
+
+    pub(crate) async fn disconnect(&self, id: i64) -> Result<(), McpError> {
+        let _change = self.changes.lock().await;
+        let previous = self
+            .slots
             .write()
             .await
-            .remove(name)
-            .ok_or("MCP 服务不存在")?;
-        let _ = server
-            .service
-            .close_with_timeout(Duration::from_secs(2))
-            .await;
+            .get_mut(&id)
+            .ok_or_else(missing)?
+            .live
+            .take();
+        if let Some(server) = previous {
+            server.close().await;
+        }
         Ok(())
     }
 
-    /// 收集当前仍连接的工具，供下一次请求模型和执行其返回的调用共同使用。
-    pub(crate) async fn tools(&self) -> McpTools {
-        let servers = self.servers.read().await;
+    pub(crate) async fn remove_server(&self, id: i64) -> Result<(), McpError> {
+        let _change = self.changes.lock().await;
+        let slot = {
+            let mut slots = self.slots.write().await;
+            if !block_in_place(|| self.store.remove_binding(self.agent_id, id))? {
+                return Err(missing());
+            }
+            slots.remove(&id).ok_or_else(missing)?
+        };
+        if let Some(server) = slot.live {
+            server.close().await;
+        }
+        Ok(())
+    }
+
+    /// 在同一时点读取内置权限和已授权的活动连接。快照只持有当时的 peer。
+    pub(super) async fn snapshot(&self) -> rusqlite::Result<super::ToolSnapshot> {
+        let slots = self.slots.read().await;
+        let policy = block_in_place(|| self.store.tool_policy(self.agent_id))?;
         let mut by_name = BTreeMap::new();
-        for server in servers.values().filter(|server| server.connected()) {
-            for (name, tool) in &server.tools {
-                by_name.insert(name.clone(), Arc::clone(tool));
+        for slot in slots.values() {
+            if let Some(live) = slot.live.as_ref().filter(|s| s.connected()) {
+                for (public, tool) in &live.tools {
+                    if slot
+                        .binding
+                        .catalog
+                        .get(public)
+                        .is_some_and(|grant| grant.enabled)
+                    {
+                        by_name.insert(public.clone(), Arc::clone(tool));
+                    }
+                }
             }
         }
-        McpTools { by_name }
+        Ok(super::ToolSnapshot {
+            policy,
+            mcp: McpTools { by_name },
+        })
     }
 
-    /// 服务端退出时取走注册表里的所有连接，并逐个关闭。
-    pub(crate) async fn shutdown(&self) {
-        let servers = std::mem::take(&mut *self.servers.write().await);
-        for mut server in servers.into_values() {
-            let _ = server
-                .service
-                .close_with_timeout(Duration::from_secs(2))
-                .await;
+    pub(super) async fn shutdown(&self) {
+        let slots = std::mem::take(&mut *self.slots.write().await);
+        for slot in slots.into_values() {
+            if let Some(server) = slot.live {
+                server.close().await;
+            }
         }
-    }
-}
-
-// ******************************** 通过快照调用工具 ********************************
-
-/// 一次模型请求的工具快照。同一批工具调用沿用当时公布的连接，无需持有服务表的锁。
-pub(crate) struct McpTools {
-    by_name: BTreeMap<String, Arc<McpTool>>,
-}
-
-impl McpTools {
-    /// 返回工具定义的迭代器，供上层组装本次模型请求的工具清单。
-    pub(super) fn definitions(&self) -> impl Iterator<Item = &Value> {
-        self.by_name.values().map(|tool| &tool.definition)
-    }
-
-    /// 查询指定工具的并发标记，来源是服务配置或工具声明的只读提示。
-    pub(super) fn supports_parallel(&self, name: &str) -> bool {
-        self.by_name
-            .get(name)
-            .is_some_and(|tool| tool.supports_parallel)
-    }
-
-    /// 找到模型指定的工具并通过快照中的连接调用它。成功时优先返回结构化 JSON，其次是文本。
-    pub(super) async fn call(&self, name: &str, arguments: &Value) -> Result<String, String> {
-        let tool = self
-            .by_name
-            .get(name)
-            .ok_or_else(|| format!("未知工具：{name}"))?;
-        let arguments = arguments
-            .as_object()
-            .ok_or("MCP 工具参数必须为 JSON 对象")?;
-        let request = CallToolRequest::new(
-            CallToolRequestParams::new(tool.original_name.clone())
-                .with_arguments(arguments.clone()),
-        );
-        if tool.peer.is_transport_closed() {
-            return Err("MCP 服务已断开，工具调用未发出".into());
-        }
-        let pending = tool
-            .peer
-            .send_cancellable_request(
-                request.into(),
-                PeerRequestOptions::with_timeout(Duration::from_secs(30)),
-            )
-            .await
-            .map_err(|error| match error {
-                ServiceError::TransportClosed => "MCP 服务已断开，工具调用未发出".into(),
-                _ => format!("MCP 工具调用未发出：{error}"),
-            })?;
-        // 已提交的调用可能在远端执行。此后等待超时或断线，无法据此判断工具是否成功。
-        let reply = pending
-            .await_response()
-            .await
-            .map_err(|error| match error {
-                ServiceError::McpError(_) => format!("MCP 调用失败：{error}"),
-                _ => format!("MCP 工具执行结果未知：{error}。重试前请先核实执行情况"),
-            })?;
-        let ServerResult::CallToolResult(result) = reply else {
-            return Err("MCP 服务未返回工具结果".into());
-        };
-        let text_blocks = result
-            .content
-            .iter()
-            .filter_map(|item| item.as_text().map(|value| value.text.as_str()))
-            .collect::<Vec<_>>();
-        if result.is_error == Some(true) {
-            let text = text_blocks.join("\n");
-            return Err(if text.is_empty() {
-                "MCP 工具执行失败".into()
-            } else {
-                text
-            });
-        }
-        if let Some(value) = result.structured_content {
-            return Ok(value.to_string());
-        }
-        if text_blocks.is_empty() && !result.content.is_empty() {
-            return Err("暂只处理 MCP 的文本和结构化 JSON 结果".into());
-        }
-        Ok(text_blocks.join("\n"))
     }
 }

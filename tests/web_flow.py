@@ -36,6 +36,9 @@ def model_call(name, call_id, arguments="{}"):
     return [{"type": "function_call", "name": name, "call_id": call_id, "arguments": arguments}]
 
 
+SERVERS = "/api/agents/1/mcp/servers"
+
+
 class Handler(BaseHTTPRequestHandler):
     """用同一个本地 HTTP 服务模拟模型和 MCP，具体回复由各测试设置的状态决定。"""
 
@@ -57,6 +60,9 @@ class Handler(BaseHTTPRequestHandler):
         self.reply(405)
 
     def do_DELETE(self):
+        on_delete = self.server.state.get("on_mcp_delete")
+        if on_delete:
+            on_delete()
         self.reply(204)
 
     def do_POST(self):
@@ -75,7 +81,8 @@ class Handler(BaseHTTPRequestHandler):
         state["requests"].append(request)
         history = request.get("input")
         tools = request.get("tools", [])
-        if (self.headers.get("Authorization") != "Bearer model-secret" or request.get("model") != "model"
+        if (self.headers.get("Authorization") != "Bearer model-secret"
+                or request.get("model") not in state.get("models", {"model"})
                 or request.get("store") is not False or request.get("stream") is not False
                 or request.get("parallel_tool_calls") is not True
                 or not isinstance(history, list) or not history or "messages" in request or "thinking" in request
@@ -126,7 +133,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def mcp(self, request):
         """校验认证及 MCP 会话 ID，模拟握手、工具发现和调用后的 JSON 或 SSE 回包。"""
-        if self.headers.get("Authorization") != "Bearer test-token" or self.headers.get("X-Test") != "test-header":
+        if (self.headers.get("Authorization") != "Bearer " + self.server.state.get("mcp_token", "test-token")
+                or self.headers.get("X-Test") != "test-header"):
             self.server.state["errors"].append("HTTP MCP 请求头错误")
             self.reply(401)
             return
@@ -142,6 +150,11 @@ class Handler(BaseHTTPRequestHandler):
             result = {"protocolVersion": request["params"]["protocolVersion"],
                       "capabilities": {"tools": {}}, "serverInfo": {"name": "test", "version": "1"}}
         elif method == "tools/list":
+            if self.server.state.get("fail_discovery"):
+                self.reply(200, {"jsonrpc": "2.0", "id": request["id"],
+                                 "error": {"code": -32603, "message": "discovery failed"}},
+                           {"Content-Type": "application/json", "Mcp-Session-Id": "web-test"})
+                return
             names = ["a.b", "a b"] if self.server.state.get("duplicate_tools") else ["demo_code"]
             result = {"tools": [{"name": name, "description": "HTTP test",
                                  "inputSchema": {"type": "object", "properties": {}}} for name in names]}
@@ -233,9 +246,10 @@ class WebIntegration(unittest.TestCase):
                 content = json.loads(content)
             return response.status, content
 
-    def new_conversation(self):
+    def new_conversation(self, agent_id=None):
         """创建空会话，返回可用于读取历史和提交消息的接口路径。"""
-        status, info = self.request("/api/conversations", "POST")
+        body = {"agent_id": agent_id} if agent_id is not None else None
+        status, info = self.request("/api/conversations", "POST", body)
         self.assertEqual(status, 200, info)
         self.assertEqual(info["title"], "新对话")
         return f"/api/conversations/{info['id']}/messages"
@@ -259,7 +273,20 @@ class WebIntegration(unittest.TestCase):
         self.addCleanup(conn.close)
         return conn
 
-    def connect_test_tools(self, hints, callback, *, server_parallel=False):
+    def binding(self, name, base=SERVERS):
+        status, data = self.request(base)
+        self.assertEqual(status, 200, data)
+        server = next(server for server in data["servers"] if server["name"] == name)
+        return base + "/" + str(server["id"]), server
+
+    def grant_all(self, name, base=SERVERS):
+        path, server = self.binding(name, base)
+        status, data = self.request(path + "/tools", "PATCH", {
+            "revision": server["revision"], "tools": dict.fromkeys(server["tools"], True),
+        })
+        self.assertEqual(status, 200, data)
+
+    def connect_test_tools(self, hints, callback, *, server_parallel=False, agent_id=1):
         """通过真实注册接口公布测试工具，并为远端调用指定回调和并发提示。"""
         state = self.server.state
         state["mcp_tools"] = [{"name": name, "inputSchema": {"type": "object"},
@@ -270,10 +297,467 @@ class WebIntegration(unittest.TestCase):
                   "headers": {"Authorization": "Bearer test-token", "X-Test": "test-header"}}
         if server_parallel:
             config["supports_parallel_tool_calls"] = True
-        status, response = self.request("/api/mcp/servers", "POST", config)
+        base = f"/api/agents/{agent_id}/mcp/servers"
+        status, response = self.request(base, "POST", config)
         self.assertEqual(status, 200, response)
+        self.grant_all("remote", base)
         state["tools"] = [f"mcp__remote__{name}" for name in hints]
         state["results"] = {f"mcp__remote__{name}": name for name in hints}
+
+    # ******************************** 助手归属、配置快照与迁移 ********************************
+
+    def test_agent_turn_isolation_and_queued_edits(self):
+        """两个助手同时请求网关。工具等待期间修改 A，只影响下一轮及新会话。"""
+        def create(name):
+            status, agent = self.request("/api/agents", "POST", {
+                "name": name, "model": "model-" + name, "instructions": "规则-" + name, "memory": "笔记-" + name,
+            })
+            self.assertEqual(status, 200, agent)
+            return agent
+
+        a, b = create("A"), create("B")
+        chat_a, chat_b = self.new_conversation(a["id"]), self.new_conversation(b["id"])
+        a_started, b_started = threading.Event(), threading.Event()
+        in_tool, release_tool = threading.Event(), threading.Event()
+
+        def model(request):
+            last = request["input"][-1]
+            if last.get("content") == "A1":
+                a_started.set()
+                self.assertTrue(b_started.wait(6))
+                return model_call("mcp__remote__slow", "hold-a")
+            if last.get("content") == "B1":
+                b_started.set()
+            return model_text()
+
+        def tool(name):
+            in_tool.set()
+            self.assertTrue(release_tool.wait(6))
+            return {"content": [{"type": "text", "text": name}]}
+
+        state = self.server.state
+        state.update(model_output=model, models={"model-A", "model-B", "model-A2"})
+        self.connect_test_tools({"slow": True}, tool, agent_id=a["id"])
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            first = pool.submit(self.request, chat_a, "POST", {"message": "A1"})
+            try:
+                self.assertTrue(a_started.wait(5))
+                self.assertEqual(self.request(chat_b, "POST", {"message": "B1"})[0], 200)
+                self.assertTrue(in_tool.wait(5))
+                self.assertEqual(self.request(chat_a.removesuffix("messages") + "turns", "POST", {"message": "A2"})[0], 202)
+                status, updated = self.request(f"/api/agents/{a['id']}", "PUT", {
+                    **a, "model": "model-A2", "instructions": "更新的规则", "memory": "更新的笔记",
+                })
+                self.assertEqual(status, 200, updated)
+            finally:
+                b_started.set()
+                release_tool.set()
+            self.assertEqual(first.result(timeout=5)[0], 200)
+        progress = self.wait_progress(chat_a, lambda p: not p["turns"])
+        self.assertIsNone(progress["last_failure"])
+        second_chat = self.new_conversation(a["id"])
+        self.assertEqual(self.request(second_chat, "POST", {"message": "A3"})[0], 200)
+
+        expected = {"A1": a, "B1": b, "A2": updated, "A3": updated}
+        seen = []
+        for request in state["requests"]:
+            users = [item["content"] for item in request["input"] if item.get("role") == "user"]
+            question = users[-1]
+            seen.append(question)
+            self.assertEqual(users, ["A1", "A2"] if question == "A2" else [question])
+            agent = expected[question]
+            self.assertEqual(request["model"], agent["model"])
+            self.assertEqual(request["instructions"], agent["instructions"] + "\n\n助手私有笔记（供参考）\n" + agent["memory"])
+        self.assertCountEqual(seen, ["A1", "A1", "A2", "A3", "B1"])
+        with sqlite3.connect(self.db_path) as db:
+            rows = db.execute("SELECT payload FROM messages").fetchall()
+            self.assertTrue(rows)
+            for (payload,) in rows:
+                for agent in (a, b, updated):
+                    self.assertNotIn(agent["instructions"], payload)
+                    self.assertNotIn(agent["memory"], payload)
+        self.assertEqual(state["errors"], [])
+
+    def test_agent_settings_and_conversation_lists(self):
+        """助手配置持久化，列表按归属过滤，过期编辑和不存在的助手返回明确错误。"""
+        default_chat = self.new_conversation()
+        default_id = self.request("/api/agents")[1]["default_agent_id"]
+        default_path = f"/api/agents/{default_id}"
+        default = self.request(default_path)[1]
+        self.assertEqual((default["name"], default["model"]), ("默认助手", "model"))
+        edit = {**default, "model": "edited", "memory": "用户的笔记"}
+        self.assertEqual(self.request(default_path, "PUT", edit)[0], 200)
+        self.assertEqual(self.request(default_path, "PUT", default)[0], 409)
+        self.assertEqual(self.request("/api/agents", "POST", {"name": " ", "model": "m"})[0], 400)
+        self.assertEqual(self.request("/api/agents", "POST", {"name": "A", "model": " "})[0], 400)
+        self.assertEqual(self.request("/api/agents", "POST", {"name": "A", "model": "m", "memory": "文"*4001})[0], 400)
+        self.assertEqual(self.request("/api/conversations", "POST", {"agent_id": 999})[0], 404)
+        self.assertEqual(self.request("/api/conversations?agent_id=999")[0], 404)
+        status, agent = self.request("/api/agents", "POST", {"name": "私有助手", "model": "m"})
+        self.assertEqual(status, 200)
+        path = self.new_conversation(agent["id"])
+        self.stop_app()
+        self.env["LLM_MODEL"] = "different-seed"
+        self.start_app()
+        self.assertEqual(self.request(default_path)[1]["model"], "edited")
+        self.assertEqual(self.request(default_path)[1]["memory"], "用户的笔记")
+        agents = self.request("/api/agents")[1]["agents"]
+        self.assertEqual(len(agents), 2)
+        self.assertTrue(all("memory" not in item and "instructions" not in item for item in agents))
+        for endpoint, chat, owner in (("/api/conversations", default_chat, default_id),
+                                      (f"/api/conversations?agent_id={agent['id']}", path, agent["id"])):
+            listed = self.request(endpoint)[1]["conversations"]
+            self.assertEqual(listed, [self.request(chat)[1]["conversation"]])
+            self.assertEqual(listed[0]["agent_id"], owner)
+
+    def test_agent_migration_preserves_conversation_sequence(self):
+        """上一版已删除的会话 ID 在增加归属后也不能复用。"""
+        self.stop_app()
+        with sqlite3.connect(self.db_path) as db:
+            db.executescript("""
+                DROP TABLE conversations;
+                DROP TABLE agents;
+                CREATE TABLE conversations (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+                INSERT INTO conversations (id, title) VALUES (7, '旧会话'), (60, '已删除');
+                DELETE FROM conversations WHERE id=60;
+                INSERT INTO messages (conversation_id, position, payload)
+                VALUES (7, 0, '{"type":"message","role":"user","content":"旧消息"}');
+            """)
+        self.start_app()
+        default_id = self.request("/api/agents")[1]["default_agent_id"]
+        old = self.request("/api/conversations/7/messages")[1]
+        self.assertEqual(old["conversation"]["agent_id"], default_id)
+        self.assertEqual(old["messages"][0]["content"], "旧消息")
+        self.assertGreater(self.request("/api/conversations", "POST")[1]["id"], 60)
+        with sqlite3.connect(self.db_path) as db:
+            self.assertFalse(db.execute("PRAGMA foreign_key_check").fetchall())
+
+    def invoke_tools(self, agent_id, calls, chat=None):
+        """让网关点名这一批工具，包括未公布的名称，检查实际发出的定义和逐条执行结果。"""
+        state = self.server.state
+        start = len(state["requests"])
+        def model(req):
+            if req["input"][-1].get("role") == "user":
+                return [model_call(name, f"{start}-{n}", json.dumps(args))[0]
+                        for n, (name, args) in enumerate(calls)]
+            return model_text()
+        state["model_output"] = model
+        status, data = self.request(chat or self.new_conversation(agent_id), "POST", {"message": "执行本轮工具"})
+        self.assertEqual(status, 200, data)
+        first, last = state["requests"][start:]
+        return {t["name"] for t in first["tools"]}, [item["output"] for item in last["input"][-len(calls):]]
+
+    def test_mcp_bindings_and_grants_survive_without_credentials(self):
+        base = SERVERS
+        state = self.server.state
+        config = {"type": "http", "url": f"http://127.0.0.1:{self.server.server_port}/mcp",
+                  "headers": {"Authorization": "Bearer test-token", "X-Test": "test-header"}}
+        name = "mcp__db__query"
+        def discover(*names):
+            state["mcp_tools"] = [{"name": n, "inputSchema": {"type": "object"}} for n in names]
+        discover("query")
+        status, data = self.request(base, "POST", {**config, "name": "db"})
+        self.assertEqual(status, 200, data)
+        path, new = self.binding("db")
+        self.assertEqual((new["tools"], new["enabled_tools"]), ([name], []))
+        names, [result] = self.invoke_tools(1, [(name, {})])
+        self.assertEqual(names, {"echo"})
+        self.assertIn("error", json.loads(result))
+        self.grant_all("db")
+        stale = {"revision": new["revision"], "tools": {name: False}}
+        self.assertEqual(self.request(path + "/tools", "PATCH", stale)[0], 409)
+        self.assertEqual(self.request(path + "/disconnect", "POST")[0], 200)
+        _, pending = self.binding("db")
+        self.assertFalse(pending["connected"] or pending["can_reconnect"])
+        self.assertEqual(pending["enabled_tools"], [name])
+        self.assertEqual(self.request(path + "/reconnect", "POST")[0], 400)
+        # 在活动连接上重启，再用此前的绑定 ID 重新配置。
+        self.assertEqual(self.request(path, "PUT", config)[0], 200)
+        self.stop_app()
+        with sqlite3.connect(self.db_path) as db:
+            stored = "\n".join(db.iterdump())
+        for secret in (config["url"], "test-token", "test-header", "Authorization"):
+            self.assertNotIn(secret, stored)
+            self.assertNotIn(secret.encode(), self.db_path.read_bytes())
+        self.start_app()
+        same_path, pending = self.binding("db")
+        self.assertEqual(same_path, path)
+        self.assertEqual(pending["tools"], pending["enabled_tools"])
+        self.assertFalse(pending["connected"] or pending["can_reconnect"])
+        self.assertEqual(self.request(path + "/reconnect", "POST")[0], 400)
+        discover("query", "export")
+        self.assertEqual(self.request(path, "PUT", config)[0], 200)
+        _, live = self.binding("db")
+        self.assertEqual(live["enabled_tools"], [name])
+        self.assertIn("mcp__db__export", live["tools"])
+        invalid = {"revision": live["revision"], "tools": {name: False, "missing": True}}
+        self.assertEqual(self.request(path + "/tools", "PATCH", invalid)[0], 400)
+        self.assertEqual(self.binding("db")[1], live)
+        names, [allowed, denied] = self.invoke_tools(1, [(name, {}), ("mcp__db__export", {})])
+        self.assertEqual(names, {"echo", name})
+        self.assertEqual(allowed, "HTTP-TEST-RESULT")
+        self.assertIn("error", json.loads(denied))
+        discover("export")
+        self.assertEqual(self.request(path + "/reconnect", "POST")[0], 200)
+        hidden = self.binding("db")[1]
+        self.assertEqual(hidden["unavailable_tools"], [name])
+        names, [denied] = self.invoke_tools(1, [(name, {})])
+        self.assertNotIn(name, names)
+        self.assertIn("error", json.loads(denied))
+        discover("query", "export")
+        self.assertEqual(self.request(path + "/reconnect", "POST")[0], 200)
+        self.assertEqual(self.binding("db")[1]["enabled_tools"], [name])
+        # 两个远端原名映射到同一个模型名称时，替换不能继承授权。
+        discover("x.y")
+        self.assertEqual(self.request(path, "PUT", config)[0], 200)
+        self.grant_all("db")
+        discover("x y")
+        self.assertEqual(self.request(path + "/reconnect", "POST")[0], 200)
+        self.assertFalse(self.binding("db")[1]["enabled_tools"])
+        self.assertEqual(self.request(path, "DELETE"), (200, {"servers": []}))
+        self.assertEqual(self.request(base, "POST", {**config, "name": "db"})[0], 200)
+        replacement, server = self.binding("db")
+        self.assertNotEqual(replacement, path)
+        self.assertEqual(self.request(path, "DELETE")[0], 404)
+        self.assertFalse(server["enabled_tools"])
+
+    def test_unchanged_grants_preserve_revision(self):
+        self.connect_test_tools({"query": True}, None)
+        path, original = self.binding("remote")
+        name = original["enabled_tools"][0]
+
+        def patch(revision, changes):
+            return self.request(path + "/tools", "PATCH", {"revision": revision, "tools": changes})
+
+        for changes in ({}, {name: True}):
+            self.assertEqual(patch(original["revision"], changes), (200, {"servers": [original]}))
+        self.assertEqual(patch(original["revision"], {"missing": False})[0], 400)
+        status, updated = patch(original["revision"], {name: False})
+        self.assertEqual(status, 200)
+        rev = updated["servers"][0]["revision"]
+        self.assertEqual(rev, original["revision"] + 1)
+        self.assertEqual(patch(original["revision"], {})[0], 409)
+        self.assertEqual(patch(rev, {name: False})[1], updated)
+        self.assertEqual(patch(rev, {name: True})[0], 200)
+
+        self.server.state["mcp_tools"] = []
+        status, data = self.request(path + "/reconnect", "POST")
+        self.assertEqual(status, 200, data)
+        hidden = data["servers"][0]
+        self.assertEqual((hidden["tools"], hidden["unavailable_tools"]), ([], [name]))
+        self.assertEqual(patch(hidden["revision"], {}), (200, data))
+        status, revoked = patch(hidden["revision"], {name: False})
+        self.assertEqual(status, 200)
+        self.assertEqual(revoked["servers"][0]["unavailable_tools"], [])
+        self.assertEqual(revoked["servers"][0]["revision"], hidden["revision"] + 1)
+
+    @unittest.skipUnless(os.environ.get("DOGO_BROWSER_TESTS") == "1", "按需运行 Playwright 浏览器回归")
+    def test_agent_panels_in_two_tabs(self):
+        self.connect_test_tools({"query": True}, None)
+        path, _ = self.binding("remote")
+        self.server.state["mcp_tools"] = []
+        self.assertEqual(self.request(path + "/reconnect", "POST")[0], 200)
+        # 浏览器稍后点重连时，模拟服务会公布这项新工具。
+        self.server.state["mcp_tools"] = [{"name": "new_tool", "inputSchema": {"type": "object"}}]
+        self.server.state["model_output"] = lambda req: (
+            model_call("memory_update", "save-note", '{"memory":"来自工具的笔记"}')
+            if req["input"][-1].get("role") == "user" else model_text()
+        )
+        policy = self.request("/api/agents/1/tools")[1]
+        self.assertEqual(self.request("/api/agents/1/tools", "PUT", {**policy, "memory_update": True})[0], 200)
+        status, other = self.request("/api/agents", "POST", {"name": "第二位助手", "model": "model"})
+        self.assertEqual(status, 200, other)
+        subprocess.run(["node", str(ROOT / "tests/agent_panels.cjs"), self.base, str(other["id"])],
+                       cwd=ROOT, check=True, timeout=90)
+        self.assertEqual(self.request("/api/agents/1")[1]["memory"], "来自工具的笔记")
+
+    def test_agents_can_bind_same_service_name_independently(self):
+        b = self.request("/api/agents", "POST", {"name": "B", "model": "model"})[1]["id"]
+        base_b = f"/api/agents/{b}/mcp/servers"
+        other = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        other.state = {"errors": [], "mcp_token": "second-token"}
+        threading.Thread(target=other.serve_forever, daemon=True).start()
+        self.addCleanup(other.server_close)
+        self.addCleanup(other.shutdown)
+        for server, tag, base in [(self.server, "A", SERVERS), (other, "B", base_b)]:
+            server.state["call_mcp"] = lambda _, value=tag: {"content": [{"type": "text", "text": value}]}
+            cfg = {"name": "db", "type": "http", "url": f"http://127.0.0.1:{server.server_port}/mcp",
+                   "headers": {"Authorization": "Bearer " + server.state.get("mcp_token", "test-token"),
+                               "X-Test": "test-header"}}
+            self.assertEqual(self.request(base, "POST", cfg)[0], 200)
+        tool = "mcp__db__demo_code"
+        self.grant_all("db")
+        self.assertEqual(self.invoke_tools(1, [(tool, {})]), ({"echo", tool}, ["A"]))
+        names, [denied] = self.invoke_tools(b, [(tool, {})])
+        self.assertEqual(names, {"echo"})
+        self.assertIn("error", json.loads(denied))
+        self.grant_all("db", base_b)
+        self.assertEqual(self.invoke_tools(b, [(tool, {})]), ({"echo", tool}, ["B"]))
+        a, binding = self.binding("db")
+        self.assertEqual(self.request(base_b + "/" + str(binding["id"]), "DELETE")[0], 404)
+        self.assertEqual(self.request(a + "/disconnect", "POST")[0], 200)
+        self.assertEqual(self.invoke_tools(b, [(tool, {})]), ({"echo", tool}, ["B"]))
+        self.assertFalse(other.state["errors"] or self.server.state["errors"])
+        self.assertEqual(self.request("/api/agents/99999/mcp/servers")[0], 404)
+
+    def test_grant_change_between_model_requests(self):
+        entered, release = threading.Event(), threading.Event()
+        self.connect_test_tools({"run": False}, lambda name: {"content": [{"type": "text", "text": name}]})
+        public = "mcp__remote__run"
+        def model(req):
+            last = req["input"][-1]
+            if last.get("role") == "user":
+                entered.set()
+                release.wait(6)
+                return model_call(public, "captured")
+            if last.get("call_id") == "captured":
+                return model_call(public, "revoked")
+            return model_text()
+        self.server.state["model_output"] = model
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            run = pool.submit(self.request, self.new_conversation(), "POST", {"message": "使用快照"})
+            try:
+                self.assertTrue(entered.wait(5))
+                path, server = self.binding("remote")
+                self.assertEqual(self.request(path + "/tools", "PATCH", {
+                    "revision": server["revision"], "tools": {public: False}})[0], 200)
+            finally:
+                release.set()
+            self.assertEqual(run.result()[0], 200)
+        first, second, third = self.server.state["requests"]
+        self.assertEqual({t["name"] for t in first["tools"]}, {"echo", public})
+        self.assertEqual([t["name"] for t in second["tools"]], ["echo"])
+        self.assertEqual(second["input"][-1]["output"], "run")
+        self.assertIn("error", json.loads(third["input"][-1]["output"]))
+
+    def test_private_memory_default_permissions_and_concurrent_edit(self):
+        b = self.request("/api/agents", "POST", {"name": "B", "model": "model", "memory": "起点"})[1]["id"]
+        policy = f"/api/agents/{b}/tools"
+        initial = self.request(policy)[1]
+        calls = [("memory_update", {"memory": "笔记"})]
+        names, [denied] = self.invoke_tools(b, calls)
+        self.assertEqual(names, {"echo"})
+        self.assertIn("error", json.loads(denied))
+        self.assertEqual(self.request(policy, "PUT", {**initial, "echo": False, "memory_update": True})[0], 200)
+        self.assertEqual(self.request(policy, "PUT", initial)[0], 409)
+        names, results = self.invoke_tools(b, calls + [
+            ("echo", {"text": "未授权"}), ("memory_update", {"agent_id": 1, "memory": "误写"}),
+            ("memory_update", {"memory": "x" * 4001}), ("memory_update", {"memory": "完成"}),
+        ])
+        self.assertEqual(names, {"memory_update"})
+        self.assertIn("已保存", results[0])
+        for output in results[1:4]:
+            self.assertIn("error", json.loads(output))
+        self.assertIn("已保存", results[4])
+        self.assertIn("起点", self.server.state["requests"][-1]["instructions"])
+        agent_path = f"/api/agents/{b}"
+        before = self.request(agent_path)[1]
+        self.assertEqual(before["memory"], "完成")
+        self.assertEqual(self.request("/api/agents/1")[1]["memory"], "")
+        entered, release = threading.Event(), threading.Event()
+        def model(req):
+            if req["input"][-1].get("role") == "user":
+                entered.set()
+                release.wait(6)
+                return model_call("memory_update", "compete", '{"memory":"迟到的旧笔记"}')
+            return model_text()
+        self.server.state["model_output"] = model
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            run = pool.submit(self.request, self.new_conversation(b), "POST", {"message": "改笔记"})
+            try:
+                self.assertTrue(entered.wait(5))
+                self.assertIn("完成", self.server.state["requests"][-1]["instructions"])
+                self.assertEqual(self.request(agent_path, "PUT", {**before, "memory": "手动保存"})[0], 200)
+            finally:
+                release.set()
+            self.assertEqual(run.result()[0], 200)
+        self.assertIn("已被", json.loads(self.server.state["requests"][-1]["input"][-1]["output"])["error"])
+        self.stop_app()
+        self.start_app()
+        self.assertEqual(self.request(agent_path)[1]["memory"], "手动保存")
+        self.assertTrue(self.request(policy)[1]["memory_update"])
+
+    def test_file_tools_enforce_agent_root_on_execution(self):
+        base = Path(self.temp.name)
+        a, b = base / "docs", base / "docs-other"
+        a.mkdir()
+        b.mkdir()
+        (a / "sub").mkdir()
+        (b / "private.txt").write_text("目录外")
+        (a / "alias").symlink_to(b, target_is_directory=True)
+        (a / "link").symlink_to(b / "private.txt")
+        os.link(b / "private.txt", a / "hard")
+        policy = "/api/agents/1/tools"
+        initial = self.request(policy)[1]
+        for root in (None, "relative", str(a / "missing"), str(b / "private.txt")):
+            self.assertEqual(self.request(policy, "PUT", {**initial, "read_file": True, "workspace_root": root})[0], 400)
+        settings = {**initial, "workspace_root": str(a), "read_file": True, "write_file": True}
+        self.assertEqual(self.request(policy, "PUT", settings)[0], 200)
+        calls = [("write_file", {"path": "sub/note", "content": "初稿"}), ("read_file", {"path": "sub/note"}),
+                 ("write_file", {"path": "sub/note", "content": "定稿"}), ("read_file", {"path": "sub/note"})]
+        bad = ["../docs-other/private.txt", str(b / "private.txt"), "link", "alias/private.txt", "hard",
+               "sub/note/", "sub/note/.", "sub/new/", "sub/new/."]
+        for path in bad:
+            calls.extend([("read_file", {"path": path}), ("write_file", {"path": path, "content": "越界"})])
+        names, results = self.invoke_tools(1, calls)
+        self.assertEqual(names, {"echo", "read_file", "write_file"})
+        self.assertEqual(results[1:4:2], ["初稿", "定稿"])
+        for out in results[4:]:
+            self.assertIn("error", json.loads(out))
+        self.assertEqual((b / "private.txt").read_text(), "目录外")
+        self.assertEqual((a / "sub/note").read_text(), "定稿")
+        self.assertFalse((a / "sub/new").exists())
+        other = self.request("/api/agents", "POST", {"name": "B", "model": "model"})[1]["id"]
+        names, [result] = self.invoke_tools(other, [("read_file", {"path": "sub/note"})])
+        self.assertEqual(names, {"echo"})
+        self.assertIn("error", json.loads(result))
+        # 工作目录本身在保存后被替换成链接，旧授权也不能跟随。
+        a.rename(base / "moved")
+        a.symlink_to(b, target_is_directory=True)
+        self.stop_app()
+        self.start_app()
+        _, [blocked] = self.invoke_tools(1, [("write_file", {"path": "escaped", "content": "错误"})])
+        self.assertIn("error", json.loads(blocked))
+        self.assertFalse((b / "escaped").exists())
+        saved = self.request(policy)[1]
+        self.assertEqual(self.request(policy, "PUT", {**saved, "memory_update": True})[0], 400)
+        status, disabled = self.request(policy, "PUT", {**saved, "read_file": False, "write_file": False})
+        self.assertEqual(status, 200, disabled)
+        self.assertEqual(disabled["workspace_root"], saved["workspace_root"])
+        self.assertEqual(self.request(policy, "PUT", {**disabled, "write_file": True})[0], 400)
+
+    def test_file_root_is_captured_for_each_model_request(self):
+        roots = [Path(self.temp.name) / name for name in ("first", "second")]
+        for root in roots:
+            root.mkdir()
+            (root / "note").write_text(root.name)
+        policy = "/api/agents/1/tools"
+        initial = self.request(policy)[1]
+        status, saved = self.request(policy, "PUT", {**initial, "workspace_root": str(roots[0]), "read_file": True})
+        self.assertEqual(status, 200, saved)
+        entered, release = threading.Event(), threading.Event()
+        def model(req):
+            last = req["input"][-1]
+            if last.get("role") == "user":
+                entered.set()
+                release.wait(6)
+                return model_call("read_file", "old-root", '{"path":"note"}')
+            if last.get("call_id") == "old-root":
+                return model_call("read_file", "new-root", '{"path":"note"}')
+            return model_text()
+        self.server.state["model_output"] = model
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            run = pool.submit(self.request, self.new_conversation(), "POST", {"message": "两次读取"})
+            try:
+                self.assertTrue(entered.wait(5))
+                self.assertEqual(self.request(policy, "PUT", {**saved, "workspace_root": str(roots[1])})[0], 200)
+            finally:
+                release.set()
+            self.assertEqual(run.result()[0], 200)
+        _, second, third = self.server.state["requests"]
+        self.assertEqual(second["input"][-1]["output"], "first")
+        self.assertEqual(third["input"][-1]["output"], "second")
 
     # ******************************** 工具并发与执行顺序 ********************************
 
@@ -495,10 +979,10 @@ class WebIntegration(unittest.TestCase):
 
     def test_mcp_edit_and_reconnect(self):
         """失败的配置替换保留原服务；重连沿用已有凭据，列表不返回凭据。"""
-        path = "/api/mcp/servers/remote"
         config = {"type": "http", "url": f"http://127.0.0.1:{self.server.server_port}/mcp",
                   "headers": {"Authorization": "Bearer test-token", "X-Test": "test-header"}}
-        self.assertEqual(self.request("/api/mcp/servers", "POST", {**config, "name": "remote"})[0], 200)
+        self.assertEqual(self.request(SERVERS, "POST", {**config, "name": "remote"})[0], 200)
+        path, _ = self.binding("remote")
         self.assertEqual(self.request(path, "PUT", {**config, "url": "invalid"})[0], 400)
         status, data = self.request(path + "/reconnect", "POST")
         self.assertEqual(status, 200, data)
@@ -509,6 +993,52 @@ class WebIntegration(unittest.TestCase):
         self.assertEqual(data["servers"][0]["tools"], ["mcp__remote__edited"])
         self.assertNotIn("test-token", json.dumps(data))
         self.assertFalse(self.server.state["errors"])
+
+    def test_rejected_mcp_connection_closes_before_returning(self):
+        state = self.server.state
+        config = {"type": "http", "url": f"http://127.0.0.1:{self.server.server_port}/mcp",
+                  "headers": {"Authorization": "Bearer test-token", "X-Test": "test-header"}}
+
+        def discover(*names):
+            state["mcp_tools"] = [{"name": name, "inputSchema": {"type": "object"}} for name in names]
+
+        discover("read")
+        for name in ("db", "db__other"):
+            self.assertEqual(self.request(SERVERS, "POST", {**config, "name": name})[0], 200)
+        self.grant_all("db")
+        path, original = self.binding("db")
+        # 拒绝候选连接的最后一步，验证 SQLite 保存失败也保留原连接。
+        with sqlite3.connect(self.db_path) as db:
+            db.execute("""CREATE TRIGGER reject_discovery BEFORE UPDATE ON mcp_bindings
+                          BEGIN SELECT RAISE(ABORT, 'reject test write'); END""")
+
+        for reason, names, status in [
+            ("服务内重名", ["a.b", "a b"], 400),
+            ("跨服务重名", ["other__read"], 400),
+            ("工具发现失败", [], 400),
+            ("绑定写入失败", ["new"], 500),
+        ]:
+            with self.subTest(reason=reason), ThreadPoolExecutor(max_workers=1) as pool:
+                discover(*names)
+                state["fail_discovery"] = reason == "工具发现失败"
+                closing, release = threading.Event(), threading.Event()
+
+                def on_delete():
+                    closing.set()
+                    release.wait(5)
+
+                state["on_mcp_delete"] = on_delete
+                attempt = pool.submit(self.request, path, "PUT", config)
+                try:
+                    self.assertTrue(closing.wait(5), "候选 HTTP 会话没有开始关闭")
+                    self.assertEqual(self.binding("db")[1], original)
+                    self.assertEqual(self.invoke_tools(1, [("mcp__db__read", {})]),
+                                     ({"echo", "mcp__db__read"}, ["HTTP-TEST-RESULT"]))
+                    self.assertFalse(attempt.done(), "接口在收到关闭回执前已返回")
+                finally:
+                    release.set()
+                    del state["on_mcp_delete"]
+                self.assertEqual(attempt.result(timeout=5)[0], status)
 
     def test_failure_can_be_recovered_by_multiple_tabs(self):
         """多个页面均可恢复失败原文和原因，重新发消息后清除旧错误，上游限流返回 429。"""
@@ -606,7 +1136,7 @@ class WebIntegration(unittest.TestCase):
             turn = pool.submit(self.request, self.new_conversation(), "POST", {"message": "切换连接"})
             try:
                 self.assertTrue(entered.wait(5))
-                self.assertEqual(self.request("/api/mcp/servers/remote", "DELETE")[0], 200)
+                self.assertEqual(self.request(self.binding("remote")[0], "DELETE")[0], 200)
                 self.connect_test_tools({"read": True, "added": True}, tool)
             finally:
                 release.set()
@@ -635,7 +1165,7 @@ class WebIntegration(unittest.TestCase):
             turn = pool.submit(self.request, self.new_conversation(), "POST", {"message": "执行工具"})
             try:
                 self.assertTrue(entered.wait(5))
-                self.assertEqual(self.request("/api/mcp/servers/remote", "DELETE")[0], 200)
+                self.assertEqual(self.request(self.binding("remote")[0] + "/disconnect", "POST")[0], 200)
             finally:
                 release.set()
             self.assertEqual(turn.result(timeout=5)[0], 200)
@@ -651,7 +1181,7 @@ class WebIntegration(unittest.TestCase):
         self.assertIn(b'id="conversation-list"', html)
         self.assertEqual(self.request("/app.js")[0], 200)
         self.assertEqual(self.request("/style.css")[0], 200)
-        self.assertEqual(self.request("/api/mcp/servers"), (200, {"servers": []}))
+        self.assertEqual(self.request(SERVERS), (200, {"servers": []}))
 
         wrapper = Path(self.temp.name) / "stdio.py"
         pid_file = Path(self.temp.name) / "stdio.pid"
@@ -665,29 +1195,35 @@ class WebIntegration(unittest.TestCase):
         )
         stdio = {"name": "local", "type": "stdio", "command": sys.executable,
                  "args": [str(wrapper)], "env": {"DEMO_KEY": "stdio-secret"}}
-        status, data = self.request("/api/mcp/servers", "POST", stdio)
+        status, data = self.request(SERVERS, "POST", stdio)
         self.assertEqual(status, 200, data)
         self.assertEqual(data["servers"][0]["tools"], ["mcp__local__demo_code"])
         self.assertNotIn("stdio-secret", json.dumps(data))
+        with sqlite3.connect(self.db_path) as db:
+            persisted = "\n".join(db.iterdump())
+        for transient in (str(wrapper), sys.executable, "DEMO_KEY", "stdio-secret"):
+            self.assertNotIn(transient, persisted)
 
         http = {"name": "remote", "type": "http", "url": f"http://127.0.0.1:{self.server.server_port}/mcp",
                 "headers": {"Authorization": "Bearer test-token", "X-Test": "test-header"}}
-        status, data = self.request("/api/mcp/servers", "POST", http)
+        status, data = self.request(SERVERS, "POST", http)
         self.assertEqual(status, 200, data)
         self.assertEqual(len(data["servers"]), 2)
         self.assertNotIn("test-token", json.dumps(data))
-        self.assertEqual(self.request("/api/mcp/servers", "POST", stdio)[0], 400)
-        self.assertEqual(self.request("/api/mcp/servers", "POST", {**stdio, "name": "bad name"})[0], 400)
-        self.assertEqual(self.request("/api/mcp/servers", "POST", {**stdio, "name": "bad", "unknown": "value"})[0], 400)
-        self.assertEqual(self.request("/api/mcp/servers", "POST", {"name": "bad", "type": "sse", "url": "http://localhost/sse"})[0], 400)
+        self.assertEqual(self.request(SERVERS, "POST", stdio)[0], 400)
+        self.assertEqual(self.request(SERVERS, "POST", {**stdio, "name": "bad name"})[0], 400)
+        self.assertEqual(self.request(SERVERS, "POST", {**stdio, "name": "bad", "unknown": "value"})[0], 400)
+        self.assertEqual(self.request(SERVERS, "POST", {"name": "bad", "type": "sse", "url": "http://localhost/sse"})[0], 400)
         self.server.state["duplicate_tools"] = True
-        status, data = self.request("/api/mcp/servers", "POST", {**http, "name": "conflict"})
+        status, data = self.request(SERVERS, "POST", {**http, "name": "conflict"})
         self.assertEqual(status, 400, data)
         self.assertIn("mcp__conflict__a_b", data["error"])
-        self.assertEqual(len(self.request("/api/mcp/servers")[1]["servers"]), 2)
+        self.assertEqual(len(self.request(SERVERS)[1]["servers"]), 2)
         self.server.state["duplicate_tools"] = False
 
         state = self.server.state
+        self.grant_all("local")
+        self.grant_all("remote")
         state["tools"] = ["mcp__local__demo_code", "mcp__remote__demo_code"]
         state["results"] = {"mcp__local__demo_code": "dogo-mcp-7264",
                             "mcp__remote__demo_code": "HTTP-TEST-RESULT"}
@@ -711,7 +1247,7 @@ class WebIntegration(unittest.TestCase):
         self.assertEqual(failed["progress"]["last_failure"]["message"], "失败的请求")
         state["fail_model"] = False
 
-        self.assertEqual(self.request("/api/mcp/servers/local", "DELETE")[0], 200)
+        self.assertEqual(self.request(self.binding("local")[0] + "/disconnect", "POST")[0], 200)
         pid = int(pid_file.read_text())
         for _ in range(30):
             try:
@@ -723,11 +1259,11 @@ class WebIntegration(unittest.TestCase):
             self.fail("断开 MCP 后子进程仍在运行")
         state["tools"] = ["mcp__remote__demo_code"]
         self.assertEqual(self.request(other, "POST", {"message": "再次调用"})[0], 200)
-        status, data = self.request("/api/mcp/servers")
-        self.assertEqual([server["name"] for server in data["servers"]], ["remote"])
-        self.assertEqual(self.request("/api/mcp/servers", "POST", stdio,
+        status, data = self.request(SERVERS)
+        self.assertEqual({s["name"]: s["connected"] for s in data["servers"]}, {"local": False, "remote": True})
+        self.assertEqual(self.request(SERVERS, "POST", stdio,
                                       {"Origin": "http://evil.example"})[0], 403)
-        self.assertEqual(self.request("/api/mcp/servers", headers={"Host": "evil.example"})[0], 403)
+        self.assertEqual(self.request(SERVERS, headers={"Host": "evil.example"})[0], 403)
         self.assertEqual(state["errors"], [])
 
     # ******************************** 会话历史、模型响应与事务 ********************************
@@ -849,8 +1385,9 @@ class WebIntegration(unittest.TestCase):
         self.assertTrue(ready, "HTTP MCP 演示服务未启动")
         url = demo.stdout.readline().strip().split()[-1]
         self.assertTrue(url.startswith("http://127.0.0.1:"), url)
-        self.assertEqual(self.request("/api/mcp/servers", "POST",
+        self.assertEqual(self.request(SERVERS, "POST",
                                       {"name": "remote", "type": "http", "url": url})[0], 200)
+        self.grant_all("remote")
         self.server.state["tools"] = ["mcp__remote__demo_code"]
         self.server.state["results"] = {"mcp__remote__demo_code": "dogo-http-7264"}
         self.assertEqual(self.request(self.new_conversation(), "POST", {"message": "调用演示工具"})[0], 200)

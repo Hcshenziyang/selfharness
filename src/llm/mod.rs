@@ -12,7 +12,6 @@ pub(crate) struct ModelClient {
     http: Client,
     url: String,
     api_key: String,
-    model: String,
     slots: Semaphore,
 }
 
@@ -23,7 +22,6 @@ impl ModelClient {
             http: Client::builder().timeout(Duration::from_secs(60)).build()?,
             url: config.model_url,
             api_key: config.api_key,
-            model: config.model_name,
             slots: Semaphore::new(config.max_model_concurrency),
         })
     }
@@ -52,11 +50,13 @@ impl ModelRequest<'_> {
     /// 一次请求消耗一个名额，读取完响应或发生错误后即释放。
     pub(crate) async fn ask_llm(
         self,
+        model: &str,
+        instructions: &str,
         input: &[Message],
         tool_definitions: &Value,
     ) -> Result<Vec<Message>, Box<dyn Error>> {
-        let body = serde_json::json!({
-            "model": &self.client.model,
+        let mut body = serde_json::json!({
+            "model": model,
             "input": input,
             "stream": false,
             // 客户端每次回传完整历史，由本地 SQLite 保存会话。
@@ -65,6 +65,9 @@ impl ModelRequest<'_> {
             "parallel_tool_calls": true
         });
 
+        if !instructions.is_empty() {
+            body["instructions"] = Value::String(instructions.to_owned());
+        }
         let response: ModelResponse = self
             .client
             .http

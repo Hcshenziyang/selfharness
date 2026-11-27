@@ -25,15 +25,22 @@ pub(crate) async fn run_turn(
     client: &ModelClient,
     mut conversation: Conversation,
     user_input: &str,
-    mcp: &tools::McpClient,
+    registry: &tools::AgentToolRegistry,
 ) -> Result<Conversation, Box<dyn Error>> {
+    let tools = registry.turn(conversation.info.agent_id, &conversation.agent.memory)?;
     conversation.add_user(user_input);
+    let instructions = conversation.agent.model_instructions();
     loop {
         // 拿到模型名额后才取工具快照。这次响应里的工具调用都使用这批连接，下一次请求再取。
         let request = client.request().await?;
-        let snapshot = mcp.tools().await;
+        let snapshot = tools.snapshot().await?;
         let output = request
-            .ask_llm(conversation.messages(), &tools::definitions(&snapshot))
+            .ask_llm(
+                &conversation.agent.model,
+                &instructions,
+                conversation.messages(),
+                &snapshot.definitions(),
+            )
             .await?;
         // ask_llm 返回时已释放名额，后续等待工具期间其他会话也能请求模型。
         let calls = output
@@ -69,7 +76,7 @@ pub(crate) async fn run_turn(
         if calls.is_empty() {
             return Ok(conversation);
         }
-        let results = tools::call_batch(&requests, &snapshot).await;
+        let results = tools.call_batch(&requests, &snapshot).await;
         for (call, content) in calls.iter().zip(results) {
             conversation.add_tool_result(&call.call_id, content);
         }

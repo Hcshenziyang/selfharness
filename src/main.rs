@@ -1,3 +1,4 @@
+mod agent;
 mod agent_loop;
 mod config;
 mod conversation;
@@ -16,7 +17,7 @@ use std::error::Error;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let config = Config::load()?;
-    let store = ConversationStore::open(&config.database_path)?;
+    let store = ConversationStore::open(&config.database_path, &config.model_name)?;
     let max_turns = config.max_unfinished_turns;
     web::serve(ModelClient::new(config)?, store, max_turns).await
 }

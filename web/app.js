@@ -1,6 +1,8 @@
-import { api, byId, element, setSidebar } from "./ui.js";
+import { api, byId, changes, element, setSidebar } from "./ui.js";
+import { setupAgentEditor, showAgents } from "./agents.js";
 import { renderMessages } from "./messages.js";
-import "./mcp.js";
+import { setToolAgent } from "./mcp.js";
+import { setupToolSettings } from "./tool-settings.js";
 
 // ******************************** 会话导航与草稿 ********************************
 
@@ -9,7 +11,10 @@ const form = byId("chat-form");
 const list = byId("conversation-list");
 const menu = byId("conversation-menu");
 const sessions = new Map();
-const changes = new BroadcastChannel("dogo-conversations");
+
+let agents = [];
+let activeAgentId = null;
+let agentRequest = 0;
 let conversations = [];
 let view;
 let listKey;
@@ -21,6 +26,7 @@ function session(id) {
 }
 
 function remember(info, first = false) {
+  if (info.agent_id !== activeAgentId) return;
   const at = conversations.findIndex(item => item.id === info.id);
   if (first || at < 0) conversations = [info, ...conversations.filter(item => item.id !== info.id)];
   else conversations[at] = info;
@@ -49,11 +55,13 @@ function updateHeader(current) {
   menu.hidden = !current.id;
   const url = new URL(location.href);
   url.searchParams.set("conversation", current.id ?? "new");
+  if (current.agentId) url.searchParams.set("agent", current.agentId);
   history.replaceState(null, "", url);
 }
 
 function showComposer() {
   const state = view.state;
+  input.disabled = !view.agentId;
   if (input.value !== state.draft) input.value = state.draft;
   input.style.height = "auto";
   input.style.height = Math.min(input.scrollHeight, 180) + "px";
@@ -86,7 +94,9 @@ function dismissed(id, failureId) {
 function openView(info, writeUrl = true) {
   clearTimeout(view?.timer);
   const id = info?.id ?? null;
-  const current = { id, info, state: session(id), ready: !id, request: 0, progress: null };
+  const agentId = info?.agent_id ?? activeAgentId;
+  const current = { id, info, agentId, state: session(id ?? "new:" + agentId),
+    ready: !id && Boolean(agentId), request: 0, progress: null };
   view = current;
   menu.open = false;
   if (writeUrl) updateHeader(current);
@@ -98,6 +108,7 @@ function openView(info, writeUrl = true) {
 }
 
 function newChat() {
+  if (!activeAgentId) return;
   if (view.id || !view.explicit) openView(null);
   view.explicit = true;
   updateHeader(view);
@@ -161,6 +172,11 @@ async function refresh(current, progressOnly = false) {
     const opening = !current.ready;
     current.ready = true;
     current.info = data.conversation;
+    current.agentId = data.conversation.agent_id;
+    if (current.agentId !== activeAgentId) {
+      selectAgent(current.agentId);
+      reloadList();
+    }
     current.progress = data.progress;
     remember(data.conversation);
     updateHeader(current);
@@ -184,6 +200,10 @@ async function refresh(current, progressOnly = false) {
       conversations = conversations.filter(item => item.id !== current.id);
       const draft = current.state.draft;
       sessions.delete(current.id);
+      if (!activeAgentId) {
+        selectAgent(current.fallbackAgentId);
+        reloadList();
+      }
       const fresh = openView(null);
       if (!fresh.state.draft) fresh.state.draft = draft;
       notice(fresh.state, "该会话已删除");
@@ -220,8 +240,8 @@ form.addEventListener("submit", async event => {
   try {
     if (!current.id) {
       // 即使切到别的会话，首条消息仍属于在此创建的会话。
-      sessions.delete(null);
-      const info = await api("/api/conversations", { method: "POST" });
+      sessions.delete("new:" + current.agentId);
+      const info = await api("/api/conversations", { method: "POST", body: { agent_id: current.agentId } });
       current.id = info.id;
       current.info = info;
       sessions.set(info.id, state);
@@ -232,8 +252,9 @@ form.addEventListener("submit", async event => {
     await api(chatPath(current.id) + "/turns", { method: "POST", body: { message: text } });
     changes.postMessage(current.id);
   } catch (error) {
-    if (!current.id && current === view) sessions.set(null, state);
-    recover(state, text, error.message);
+    const draftKey = "new:" + current.agentId;
+    if (!current.id && !sessions.has(draftKey)) sessions.set(draftKey, state);
+    recover(current.id ? state : sessions.get(draftKey), text, error.message);
   } finally {
     state.admitting = false;
     if (view.state === state) showComposer();
@@ -293,29 +314,92 @@ menu.addEventListener("keydown", event => {
 // ******************************** 页面加载与跨标签同步 ********************************
 
 async function loadList() {
+  if (!activeAgentId) return;
   const request = ++listRequest;
-  const data = await api("/api/conversations");
+  const data = await api("/api/conversations?agent_id=" + activeAgentId);
   if (request !== listRequest) return;
   conversations = data.conversations;
   showList();
 }
 
+function reloadList() {
+  const id = activeAgentId;
+  loadList().catch(error => {
+    if (id === activeAgentId) notice(view.state, error.message);
+  });
+}
+
+function selectAgent(id) {
+  if (id !== activeAgentId) {
+    ++listRequest;
+    conversations = [];
+    activeAgentId = id;
+    setToolAgent(id);
+  }
+  showAgents(agents, id);
+}
+
+function switchAgent(id) {
+  selectAgent(id);
+  openView(null);
+  reloadList();
+}
+
+async function loadAgents() {
+  const request = ++agentRequest;
+  const data = await api("/api/agents");
+  if (request === agentRequest) {
+    agents = data.agents;
+    showAgents(agents, activeAgentId);
+  }
+  return data.default_agent_id;
+}
+
+setupToolSettings(() => activeAgentId);
+byId("agent-select").addEventListener("change", event => switchAgent(Number(event.target.value)));
+setupAgentEditor((agent, created) => {
+  ++agentRequest;
+  const summary = { id: agent.id, name: agent.name, model: agent.model };
+  const at = agents.findIndex(item => item.id === agent.id);
+  if (at < 0) agents.push(summary);
+  else agents[at] = summary;
+  if (created) switchAgent(agent.id);
+  else showAgents(agents, activeAgentId);
+  changes.postMessage({ agentsChanged: true, agent_id: agent.id, revision: agent.revision });
+});
+
 changes.addEventListener("message", event => {
-  loadList().catch(error => notice(view.state, error.message));
+  if (event.data?.mcpChanged || event.data?.toolPolicyChanged) return;
+  if (event.data?.agentsChanged) {
+    loadAgents().catch(error => notice(view.state, error.message));
+    return;
+  }
+  reloadList();
   if (event.data === view.id) refresh(view);
 });
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden && view.id) refresh(view);
 });
 
-const initial = openView(null, false);
-const requested = new URLSearchParams(location.search).get("conversation");
-loadList().then(() => {
-  if (view !== initial || initial.id || initial.state.admitting || input.value || initial.explicit) return;
-  const info = requested ? conversations.find(item => String(item.id) === requested) : conversations[0];
-  if (info) openView(info);
-  else if (requested && requested !== "new") {
-    updateHeader(initial);
-    notice(initial.state, "该会话不存在");
+async function initialize() {
+  const params = new URLSearchParams(location.search);
+  const defaultId = await loadAgents();
+  const requestedAgent = Number(params.get("agent"));
+  const fallbackId = agents.some(agent => agent.id === requestedAgent) ? requestedAgent : defaultId;
+  const requested = params.get("conversation");
+  if (requested && requested !== "new" && /^[1-9]\d*$/.test(requested) && Number.isSafeInteger(Number(requested))) {
+    // 直链只需会话 ID，历史接口返回的归属优先于 URL 中的助手。
+    const current = openView({ id: Number(requested) }, false);
+    current.fallbackAgentId = fallbackId;
+    return;
   }
-}).catch(error => notice(initial.state, error.message));
+  selectAgent(fallbackId);
+  const initial = openView(null);
+  await loadList();
+  if (view !== initial || initial.id || initial.state.admitting || input.value || initial.explicit) return;
+  if (!requested && conversations.length) openView(conversations[0]);
+  else if (requested && requested !== "new") notice(initial.state, "该会话不存在");
+}
+
+openView(null, false);
+initialize().catch(error => notice(view.state, error.message));

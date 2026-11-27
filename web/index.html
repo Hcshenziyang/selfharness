@@ -27,16 +27,25 @@
       </div>
 
       <div class="sidebar-section">
+        <div class="agent-picker">
+          <div class="agent-heading">
+            <label class="sidebar-label" for="agent-select">助手</label>
+            <button type="button" id="new-agent" disabled>新建助手</button>
+            <button type="button" id="edit-agent" disabled>编辑</button>
+          </div>
+          <select id="agent-select" disabled></select>
+        </div>
         <section id="conversation-history" aria-labelledby="history-label" hidden>
           <p id="history-label" class="sidebar-label">历史会话</p>
           <div id="conversation-list" class="conversation-list"></div>
         </section>
+        <button id="edit-tools" class="sidebar-action" type="button" aria-haspopup="dialog" aria-controls="tool-dialog" disabled>内置工具与工作目录</button>
         <p class="sidebar-label">MCP 服务</p>
         <p id="server-list-error" class="feedback error" role="alert" hidden></p>
         <button id="retry-servers" class="sidebar-action" type="button" hidden>重新加载服务列表</button>
         <div id="servers" class="servers" aria-live="polite"></div>
 
-        <button id="toggle-form" class="sidebar-action" type="button" aria-expanded="false" aria-haspopup="dialog" aria-controls="server-dialog">
+        <button id="toggle-form" class="sidebar-action" type="button" disabled aria-expanded="false" aria-haspopup="dialog" aria-controls="server-dialog">
           <svg class="sidebar-action-icon" width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
           <span class="sidebar-action-text">添加服务</span>
         </button>
@@ -114,8 +123,43 @@
     </main>
   </div>
   <div id="sidebar-overlay" class="sidebar-overlay" hidden></div>
-  <dialog id="server-dialog" aria-labelledby="server-form-title">
-    <form id="server-form" class="server-form">
+  <dialog id="agent-dialog" class="settings-dialog" aria-labelledby="agent-form-title">
+    <form id="agent-form" class="settings-form">
+      <div class="form-heading">
+        <h2 id="agent-form-title">编辑助手</h2>
+        <button id="close-agent" class="btn-icon" type="button" aria-label="关闭助手设置">×</button>
+      </div>
+      <label for="agent-name">助手名称</label>
+      <input id="agent-name" name="name" required autocomplete="off">
+      <label for="agent-model">模型 ID</label>
+      <input id="agent-model" name="model" required autocomplete="off" spellcheck="false">
+      <label for="agent-instructions">指令</label>
+      <textarea id="agent-instructions" name="instructions" rows="3" placeholder="这个助手负责什么，应该怎样回答"></textarea>
+      <label for="agent-memory">私有记忆 <span>该助手的各段会话共用，最多 4000 字符</span></label>
+      <textarea id="agent-memory" name="memory" rows="4"></textarea>
+      <p id="agent-error" class="feedback error" role="alert" hidden></p>
+      <button id="save-agent" class="btn btn-primary btn-full" type="submit">保存</button>
+    </form>
+  </dialog>
+  <dialog id="tool-dialog" class="settings-dialog" aria-labelledby="tool-title">
+    <form id="tool-form" class="settings-form">
+      <div class="form-heading">
+        <h2 id="tool-title">内置工具与工作目录</h2>
+        <button id="close-tools" class="btn-icon" type="button" aria-label="关闭工具设置">×</button>
+      </div>
+      <label><input type="checkbox" name="echo"> 回声测试 <code>echo</code></label>
+      <label><input type="checkbox" name="memory_update"> 允许助手更新私有记忆</label>
+      <label for="workspace-root">文件工作目录 <span>本机已有目录的绝对路径</span></label>
+      <input id="workspace-root" name="workspace_root" type="text" autocomplete="off" spellcheck="false">
+      <label><input type="checkbox" name="read_file"> 读取目录内的文本文件</label>
+      <label><input type="checkbox" name="write_file"> 创建或替换目录内的文本文件</label>
+      <p class="edit-hint">此目录约束内置文件工具。外部 MCP 服务使用各自的进程权限或远端凭据。</p>
+      <p id="tool-error" class="feedback error" role="alert" hidden></p>
+      <button id="save-tools" class="btn btn-primary btn-full" type="submit">保存</button>
+    </form>
+  </dialog>
+  <dialog id="server-dialog" class="settings-dialog" aria-labelledby="server-form-title">
+    <form id="server-form" class="settings-form">
       <div class="form-heading">
         <h2 id="server-form-title">连接 MCP 服务</h2>
         <button id="cancel-form" class="btn-icon" type="button" aria-label="关闭配置">

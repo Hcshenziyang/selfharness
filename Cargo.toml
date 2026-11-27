@@ -5,6 +5,9 @@ edition = "2024"
 
 [dependencies]
 axum = "0.8"
+cap-std = "4"
+cap-fs-ext = "4"
+cap-tempfile = "4"
 futures-util = "0.3"
 reqwest = { version = "0.13", features = ["json"] }
 rmcp = { version = "3.11", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }

@@ -294,8 +294,22 @@ h1, h2, h3, h4, p, ul, ol {
   color: #e28587;
 }
 
-/* ******************************** MCP 连接表单 ******************************** */
-#server-dialog {
+.agent-picker { margin: 0 0 12px; }
+.agent-heading { display: flex; align-items: center; gap: 12px; margin-bottom: 6px; }
+.agent-heading .sidebar-label { margin: 0 auto 0 0; }
+.agent-heading button { background: transparent; color: var(--sidebar-text-muted); font-size: .78rem; }
+.agent-heading button:hover { color: var(--sidebar-text); }
+.agent-picker select {
+  width: 100%;
+  padding: 7px 8px;
+  background: var(--sidebar-surface);
+  color: var(--sidebar-text);
+  border: 1px solid var(--sidebar-border);
+  border-radius: var(--radius-sm);
+}
+
+/* ******************************** 助手与 MCP 设置表单 ******************************** */
+.settings-dialog {
   width: min(520px, calc(100vw - 32px));
   max-height: calc(100dvh - 40px);
   padding: 0;
@@ -306,8 +320,8 @@ h1, h2, h3, h4, p, ul, ol {
   box-shadow: var(--shadow-lg);
 }
 
-#server-dialog::backdrop { background: rgba(46, 38, 31, 0.5); }
-.server-form { padding: 20px 24px; }
+.settings-dialog::backdrop { background: rgba(46, 38, 31, 0.5); }
+.settings-form { padding: 20px 24px; }
 .edit-hint { font-size: 0.85rem; color: var(--sidebar-text-muted); }
 
 .form-heading {
@@ -323,7 +337,7 @@ h1, h2, h3, h4, p, ul, ol {
   color: var(--sidebar-text);
 }
 
-.server-form label {
+.settings-form label {
   display: block;
   margin: 10px 0 4px;
   font-size: 0.76rem;
@@ -331,15 +345,15 @@ h1, h2, h3, h4, p, ul, ol {
   color: var(--sidebar-text-muted);
 }
 
-.server-form label span {
+.settings-form label span {
   color: var(--sidebar-text-dim);
   font-weight: 400;
   margin-left: 4px;
 }
 
-.server-form input,
-.server-form textarea,
-.server-form select {
+.settings-form input,
+.settings-form textarea,
+.settings-form select {
   width: 100%;
   border: 1px solid var(--sidebar-border);
   background: var(--sidebar-bg);
@@ -350,33 +364,33 @@ h1, h2, h3, h4, p, ul, ol {
   transition: border-color var(--duration-fast) var(--ease-smooth), box-shadow var(--duration-fast) var(--ease-smooth);
 }
 
-.server-form input[type="checkbox"] {
+.settings-form input[type="checkbox"] {
   width: auto;
   vertical-align: middle;
 }
 
-.server-form input::placeholder,
-.server-form textarea::placeholder {
+.settings-form input::placeholder,
+.settings-form textarea::placeholder {
   color: var(--sidebar-text-dim);
   opacity: 0.8;
 }
 
-.server-form input:focus,
-.server-form textarea:focus,
-.server-form select:focus {
+.settings-form input:focus,
+.settings-form textarea:focus,
+.settings-form select:focus {
   border-color: #d77f82;
   box-shadow: 0 0 0 2px rgba(215, 127, 130, 0.25);
   outline: none;
 }
 
-.server-form textarea {
+.settings-form textarea {
   resize: vertical;
   line-height: 1.45;
   font-family: var(--font-mono);
   font-size: 0.78rem;
 }
 
-.server-form select {
+.settings-form select {
   appearance: none;
   padding-right: 28px;
 }
@@ -492,24 +506,14 @@ h1, h2, h3, h4, p, ul, ol {
   background: rgba(255, 255, 255, 0.06);
 }
 
-.server-tools-list {
-  padding: 6px 0 2px 4px;
-  margin: 0;
-  list-style: none;
-  font-size: 0.72rem;
+.tool-hint, .tool-choice {
+  margin: 4px 0;
+  font-size: 0.76rem;
   color: var(--sidebar-text-muted);
-  line-height: 1.5;
 }
-
-.server-tools-list li {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  padding: 2px 0;
-  word-break: break-all;
-}
-
-.server-actions { display: flex; gap: 6px; margin-top: 6px; }
+.tool-choice { display: flex; align-items: baseline; gap: 6px; overflow-wrap: anywhere; }
+.tool-choice input { flex: none; accent-color: var(--accent); }
+.server-actions { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
 
 .server-action {
   font-size: 0.72rem;
@@ -525,7 +529,7 @@ h1, h2, h3, h4, p, ul, ol {
   background: var(--sidebar-surface);
 }
 
-.server-action:last-child:hover:not(:disabled) {
+.server-card > .server-actions > .server-action:last-child:hover:not(:disabled) {
   color: #ff7d7d;
   background: rgba(255, 125, 125, 0.12);
 }

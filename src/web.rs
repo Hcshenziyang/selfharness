@@ -1,12 +1,16 @@
 //! 网页通过 [`enqueue`] 提交消息，由 [`AppState::run_queue`] 调用 [`agent_loop::run_turn`]。
 //! 回合结束后，[`TurnQueues::finish`] 处理结果并取下一条消息。
 
+mod agents;
+mod tool_routes;
 mod turns;
 
-use crate::{agent_loop, conversation::ConversationStore, llm::ModelClient, tools};
+use crate::{
+    agent::DEFAULT_AGENT_ID, agent_loop, conversation::ConversationStore, llm::ModelClient, tools,
+};
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path, Request, State},
+    extract::{DefaultBodyLimit, Path, Query, Request, State},
     http::{StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -31,7 +35,7 @@ struct AppState {
     model: ModelClient,
     chats: Mutex<TurnQueues>,
     workers: TaskTracker,
-    mcp: tools::McpClient,
+    tools: tools::AgentToolRegistry,
     port: u16,
 }
 
@@ -48,7 +52,7 @@ impl AppState {
                 Ok(conversation) => tokio::select! {
                     biased;
                     _ = work.cancel.cancelled() => Err(turns::cancelled()),
-                    result = agent_loop::run_turn(&self.model, conversation, &work.message, &self.mcp) =>
+                    result = agent_loop::run_turn(&self.model, conversation, &work.message, &self.tools) =>
                         result.map_err(turn_error),
                 },
                 Err(error) => Err(database_error(error)),
@@ -94,13 +98,15 @@ pub(crate) async fn serve(
     let state = Arc::new(AppState {
         model,
         port,
+        tools: tools::AgentToolRegistry::new(store.clone()),
         chats: Mutex::new(TurnQueues::new(store, max_turns)),
         workers: TaskTracker::new(),
-        mcp: tools::McpClient::default(),
     });
     let app = Router::new()
         .route("/", get(index))
         .route("/{file}", get(asset))
+        .route("/api/agents", get(agents::list).post(agents::create))
+        .route("/api/agents/{id}", get(agents::get).put(agents::update))
         .route(
             "/api/conversations",
             get(conversations).post(create_conversation),
@@ -119,15 +125,7 @@ pub(crate) async fn serve(
             axum::routing::delete(stop_turn),
         )
         .route("/api/conversations/{id}/progress", get(progress))
-        .route("/api/mcp/servers", get(servers).post(connect))
-        .route(
-            "/api/mcp/servers/{name}",
-            axum::routing::put(edit_server).delete(disconnect),
-        )
-        .route(
-            "/api/mcp/servers/{name}/reconnect",
-            axum::routing::post(reconnect),
-        )
+        .nest("/api/agents/{id}", tool_routes::routes())
         .layer(DefaultBodyLimit::max(64 * 1024))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
@@ -142,7 +140,7 @@ pub(crate) async fn serve(
         .await;
     state.workers.close();
     state.workers.wait().await;
-    state.mcp.shutdown().await;
+    state.tools.shutdown().await;
     result?;
     Ok(())
 }
@@ -234,8 +232,10 @@ async fn asset(Path(file): Path<String>) -> Response {
     let js = "text/javascript; charset=utf-8";
     let (mime, content) = match file.as_str() {
         "app.js" => (js, include_str!("../web/app.js")),
+        "agents.js" => (js, include_str!("../web/agents.js")),
         "ui.js" => (js, include_str!("../web/ui.js")),
         "messages.js" => (js, include_str!("../web/messages.js")),
+        "tool-settings.js" => (js, include_str!("../web/tool-settings.js")),
         "mcp.js" => (js, include_str!("../web/mcp.js")),
         "markdown-it.min.js" => (js, include_str!("../web/vendor/markdown-it.min.js")),
         "style.css" => ("text/css; charset=utf-8", include_str!("../web/style.css")),
@@ -246,19 +246,38 @@ async fn asset(Path(file): Path<String>) -> Response {
 
 // ******************************** 会话与聊天接口 ********************************
 
-/// 返回侧栏需要的会话列表。
-async fn conversations(State(state): State<Arc<AppState>>) -> ApiResult {
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentSelection {
+    agent_id: Option<i64>,
+}
+
+/// 只列出指定助手的会话。未带筛选条件的旧客户端使用默认助手。
+async fn conversations(
+    State(state): State<Arc<AppState>>,
+    Query(selection): Query<AgentSelection>,
+) -> ApiResult {
     let list = state
-        .with_chats(|chats| chats.store.list())
-        .map_err(database_error)?;
+        .with_chats(|chats| {
+            chats
+                .store
+                .list(selection.agent_id.unwrap_or(DEFAULT_AGENT_ID))
+        })
+        .map_err(agents::store_error)?;
     Ok(Json(json!({ "conversations": list })))
 }
 
 /// 创建空会话并返回其 ID，供网页随后发送首条消息。
-async fn create_conversation(State(state): State<Arc<AppState>>) -> ApiResult {
+async fn create_conversation(
+    State(state): State<Arc<AppState>>,
+    input: Option<Json<AgentSelection>>,
+) -> ApiResult {
+    let agent_id = input
+        .and_then(|Json(selection)| selection.agent_id)
+        .unwrap_or(DEFAULT_AGENT_ID);
     let info = state
-        .with_chats(|chats| chats.store.create())
-        .map_err(database_error)?;
+        .with_chats(|chats| chats.store.create(agent_id))
+        .map_err(agents::store_error)?;
     Ok(Json(json!(info)))
 }
 
@@ -349,64 +368,4 @@ async fn stop_turn(
 ) -> Result<StatusCode, ApiError> {
     state.with_chats(|chats| chats.cancel(id, turn))?;
     Ok(StatusCode::NO_CONTENT)
-}
-
-// ******************************** MCP 服务管理接口 ********************************
-
-/// 返回已注册的 MCP 服务及各自的工具。
-async fn servers(State(state): State<Arc<AppState>>) -> ApiResult {
-    Ok(Json(json!({ "servers": state.mcp.servers().await })))
-}
-
-/// 分别读取服务名称和连接配置，注册成功后返回最新服务列表。
-async fn connect(State(state): State<Arc<AppState>>, Json(mut input): Json<Value>) -> ApiResult {
-    let object = input
-        .as_object_mut()
-        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "配置必须是 JSON 对象"))?;
-    let name = object
-        .remove("name")
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "请填写服务名称"))?;
-    let config: tools::ServerConfig = serde_json::from_value(input)
-        .map_err(|error| api_error(StatusCode::BAD_REQUEST, format!("配置格式错误：{error}")))?;
-    state
-        .mcp
-        .add_server(name, config)
-        .await
-        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
-    servers(State(state)).await
-}
-
-/// 按服务名断开连接，并把更新后的列表返回网页。
-async fn disconnect(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> ApiResult {
-    state
-        .mcp
-        .remove_server(&name)
-        .await
-        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
-    servers(State(state)).await
-}
-
-/// 验证新配置并连接成功后才替换同名服务。
-async fn edit_server(
-    State(state): State<Arc<AppState>>,
-    Path(name): Path<String>,
-    Json(config): Json<tools::ServerConfig>,
-) -> ApiResult {
-    state
-        .mcp
-        .replace_server(name, Some(config))
-        .await
-        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))?;
-    servers(State(state)).await
-}
-
-/// 用服务端保存的配置重连，凭据始终留在注册表内。
-async fn reconnect(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> ApiResult {
-    state
-        .mcp
-        .replace_server(name, None)
-        .await
-        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))?;
-    servers(State(state)).await
 }
